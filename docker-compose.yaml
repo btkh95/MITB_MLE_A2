@@ -1,0 +1,64 @@
+x-airflow-common: &airflow-common
+  build: .
+  image: cs611-a2-airflow
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    AIRFLOW__CORE__FERNET_KEY: PAqBeGJLJTYFzVkOGHWIYXdLO7XdXz5yTdxAGJe9ezM=
+    # Same secret on webserver and scheduler so task logs can be read in the UI
+    AIRFLOW__WEBSERVER__SECRET_KEY: cs611-assignment2
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "True"
+    PYTHONPATH: /opt/airflow
+  user: "${AIRFLOW_UID:-50000}:0"
+  volumes:
+    - airflow_data:/opt/airflow
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./utils:/opt/airflow/utils
+    - ./static:/opt/airflow/static
+    - ./data:/opt/airflow/data
+    - ./datamart:/opt/airflow/datamart
+    - ./model_bank:/opt/airflow/model_bank
+
+services:
+  airflow-init:
+    <<: *airflow-common
+    # Root only to create output folders writable by the airflow user, then hand off
+    user: "0:0"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -p /opt/airflow/datamart /opt/airflow/model_bank /opt/airflow/logs
+        /entrypoint airflow version
+        # Root created the SQLite DB during migration; give it (and its folder) to the airflow user
+        chown "${AIRFLOW_UID:-50000}:0" /opt/airflow
+        find /opt/airflow -maxdepth 1 -type f -exec chown "${AIRFLOW_UID:-50000}:0" {} +
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/datamart /opt/airflow/model_bank /opt/airflow/logs
+        echo "Airflow UI: http://localhost:8080  (login admin / admin)"
+
+  airflow-webserver:
+    <<: *airflow-common
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  airflow-scheduler:
+    <<: *airflow-common
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: scheduler
+
+volumes:
+  airflow_data:

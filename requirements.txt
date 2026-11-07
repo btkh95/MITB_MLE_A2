@@ -1,0 +1,9 @@
+# pandas/numpy pinned to Airflow 2.10.5's tested versions (unpinned, pip pulls pandas 3)
+pandas==2.1.4
+numpy==1.26.4
+pyspark==3.5.5
+scikit-learn==1.6.1
+xgboost==2.1.4
+matplotlib==3.10.0
+seaborn==0.13.2
+PyYAML>=6.0,<7
