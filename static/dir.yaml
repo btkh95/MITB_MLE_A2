@@ -1,0 +1,10 @@
+bronze:
+  datasets:
+    fe_click:
+      filename: feature_clickstream.csv
+    fe_attr:
+      filename: features_attributes.csv
+    fe_fin:
+      filename: features_financials.csv
+    lms:
+      filename: lms_loan_daily.csv

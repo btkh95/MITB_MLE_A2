@@ -1,0 +1,16 @@
+# Valid ranges chosen from EDA of features_financials.csv.
+# Values outside a range are replaced with null in silver and flagged as <column>_invalid.
+
+# column: [low, high]
+value_ranges:
+  Interest_Rate: [0, 34]
+  Num_Bank_Accounts: [0, 11]
+  Num_Credit_Card: [0, 11]
+  Num_Credit_Inquiries: [0, 17]
+  Num_of_Delayed_Payment: [0, 28]
+
+# column / Monthly_Inhand_Salary: [low, high]
+# Installments cannot exceed monthly salary; annual income above 30x monthly salary taken as error.
+salary_ratio_ranges:
+  Total_EMI_per_month: [0, 1]
+  Annual_Income: [0, 30]

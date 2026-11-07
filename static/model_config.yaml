@@ -1,0 +1,112 @@
+# Model training, governance and monitoring settings.
+
+training:
+  # scheduled training dates; a drift alert can also trigger training in between
+  first_train_date: "2024-01-01"
+  retrain_every_months: 6
+  # minimum months between two trainings, so one drift alert does not retrain every month
+  retrain_cooldown_months: 3
+  # newest label months held out as out-of-time (OOT) test
+  oot_label_months: 2
+  validation_ratio: 0.2
+  random_state: 55
+  # drop a feature when this share of the current month's applicants lack it
+  max_missing_share: 0.5
+
+promotion:
+  # a challenger replaces the champion only if its OOT AUC is higher by this margin
+  min_auc_gain: 0.01
+
+monitoring:
+  psi_watch: 0.1
+  psi_act: 0.25
+  # flag retraining when Gini falls below this share of the model's OOT Gini
+  min_gini_ratio: 0.9
+  # months between a prediction and its default label (label definition 30dpd_6mob)
+  label_lag_months: 6
+
+# Explicit allowlist: only these gold feature store columns can reach a model.
+# Raw monetary columns have *_log1p twins; logistic regression uses the logs, XGBoost the raw values.
+features:
+  numeric:
+    - Age
+    - Annual_Income
+    - Monthly_Inhand_Salary
+    - Num_Bank_Accounts
+    - Num_Credit_Card
+    - Interest_Rate
+    - Num_of_Loan
+    - Delay_from_due_date
+    - Num_of_Delayed_Payment
+    - Changed_Credit_Limit
+    - Num_Credit_Inquiries
+    - Outstanding_Debt
+    - Credit_Utilization_Ratio
+    - Total_EMI_per_month
+    - Amount_invested_monthly
+    - Monthly_Balance
+    - listed_loan_count
+    - Credit_History_Months
+    - months12_to_annual_income_ratio
+    - EMI_to_Salary_Ratio
+    - Debt_to_Income
+    - Disposable_Income
+    - Num_Fin_Pdts
+    - Loans_per_Credit_Item
+    - Loan_Extent
+    - Loan_Auto_Loan
+    - Loan_Credit_Builder_Loan
+    - Loan_Debt_Consolidation_Loan
+    - Loan_Home_Equity_Loan
+    - Loan_Mortgage_Loan
+    - Loan_Not_Specified
+    - Loan_Payday_Loan
+    - Loan_Personal_Loan
+    - Loan_Student_Loan
+    - Annual_Income_log1p
+    - Monthly_Inhand_Salary_log1p
+    - Outstanding_Debt_log1p
+    - Total_EMI_per_month_log1p
+    - Amount_invested_monthly_log1p
+    - Monthly_Balance_log1p
+    - has_clickstream
+    - fe_1_mean
+    - fe_2_mean
+    - fe_3_mean
+    - fe_4_mean
+    - fe_5_mean
+    - fe_6_mean
+    - fe_7_mean
+    - fe_8_mean
+    - fe_9_mean
+    - fe_10_mean
+    - fe_11_mean
+    - fe_12_mean
+    - fe_13_mean
+    - fe_14_mean
+    - fe_15_mean
+    - fe_16_mean
+    - fe_17_mean
+    - fe_18_mean
+    - fe_19_mean
+    - fe_20_mean
+  flags:
+    - age_invalid
+    - occupation_missing
+    - loan_types_missing
+    - loan_count_suspicious
+    - interest_rate_invalid
+    - num_bank_accounts_invalid
+    - num_credit_card_invalid
+    - num_credit_inquiries_invalid
+    - num_of_delayed_payment_invalid
+    - total_emi_per_month_invalid
+    - annual_income_invalid
+  categorical:
+    - Occupation
+    - Credit_Mix
+    - Payment_of_Min_Amount
+    - loan_count_status
+    - Spending_Behaviour
+    - Payments_Size
+  # excluded on purpose: clickstream_days (calendar proxy), has_attributes / has_financials (always 1)

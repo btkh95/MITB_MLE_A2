@@ -1,0 +1,67 @@
+fe_attr:
+  Customer_ID: string
+  Occupation: string
+  snapshot_date: date
+  Age: integer
+
+lms:
+  loan_id: string
+  Customer_ID: string
+  loan_start_date: date
+  tenure: integer
+  installment_num: integer
+  loan_amt: number
+  due_amt: number
+  paid_amt: number
+  overdue_amt: number
+  balance: number
+  snapshot_date: date
+
+fe_fin:
+  Customer_ID: string
+  Annual_Income: number
+  Monthly_Inhand_Salary: number
+  Num_Bank_Accounts: integer
+  Num_Credit_Card: integer
+  Interest_Rate: number
+  Num_of_Loan: integer
+  Type_of_Loan: string
+  Delay_from_due_date: integer
+  Num_of_Delayed_Payment: integer
+  Changed_Credit_Limit: number
+  Num_Credit_Inquiries: integer
+  Credit_Mix: string
+  Outstanding_Debt: number
+  Credit_Utilization_Ratio: number
+  Credit_History_Age: string
+  Payment_of_Min_Amount: string
+  Total_EMI_per_month: number
+  Amount_invested_monthly: number
+  Payment_Behaviour: string
+  Monthly_Balance: number
+  snapshot_date: date
+
+fe_click:
+  Customer_ID: string
+  snapshot_date: date
+  fe_1: integer
+  fe_2: integer
+  fe_3: integer
+  fe_4: integer
+  fe_5: integer
+  fe_6: integer
+  fe_7: integer
+  fe_8: integer
+  fe_9: integer
+  fe_10: integer
+  fe_11: integer
+  fe_12: integer
+  fe_13: integer
+  fe_14: integer
+  fe_15: integer
+  fe_16: integer
+  fe_17: integer
+  fe_18: integer
+  fe_19: integer
+  fe_20: integer
+    
