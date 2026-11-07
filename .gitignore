@@ -1,1 +1,19 @@
 Notes/
+
+# Generated outputs (keep the folders)
+datamart/*
+!datamart/.gitkeep
+model_bank/*
+!model_bank/.gitkeep
+logs/
+
+# Notebook checkpoints and Python caches
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# Docs folder (personal notes, report and slide files)
+docs/
+
+# Local environment settings
+.env
