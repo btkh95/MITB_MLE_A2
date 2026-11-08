@@ -27,7 +27,7 @@ The backfill covers 31 monthly runs (2023-01 to 2025-07). Airflow runs one task 
 | Label store | `bronze_lms` → `silver_lms` → `gold_label_store` | `datamart/gold/label_store/` — loans reaching month on book 6 this month, labelled `30dpd_6mob` |
 | Feature store | bronze, silver and gold for attributes, financials and clickstream → `gold_feature_store` | `datamart/gold/feature_store/joined/` — one row per applicant, as of the application date |
 | Training gate | `model_train_gate` | Trains on the first training date (2024-01-01), then every month while applications arrive (launch setting; configurable, for example every 6 months later), or after a drift alert (minimum 3 months apart); otherwise skips training |
-| Training | `model_train` | Trains logistic regression and XGBoost on labels already observed at the run date, then keeps the one with the higher Gini on the model-selection holdout, preferring logistic regression when the two are within 0.01. Calibrates the probabilities if that helps, and records feature importance and lineage → `model_bank/credit_model_YYYY_MM_DD_<family>/`, where the family is `logreg` or `xgboost` |
+| Training | `model_train` | Trains logistic regression and XGBoost on labels already observed at the run date, then keeps the one with the higher Gini on the model-selection holdout, preferring logistic regression when the two are within 0.01. Calibrates the probabilities if that helps, and records feature importance and lineage → `model_bank/credit_model_YYYY_MM_DD_<family>_<fit id>/`, where the family is `logreg` or `xgboost` and the fit id is the UTC time of the run, so a rerun never overwrites an earlier model. After the reload check passes, training writes `model_bank/fits/YYYY_MM_DD.json` naming the exact model that promotion must evaluate |
 | Promotion | `model_promote` | Champion/challenger decision logged to `model_bank/model_registry.csv` |
 | Inference | `model_inference` | Checks the input, scores this month's applications with the current champion and adds the top 3 reasons behind each score → `datamart/gold/model_predictions/`. Shadow models score the same applicants → `model_predictions/shadow/` |
 | Monitoring | `model_monitor` | PSI of this month's scores and CSI of each input feature vs the model's out-of-time data at training, plus AUC, Gini, KS and actual vs predicted default rate for the applications scored 6 months ago, and the same live Gini for each shadow model → `datamart/gold/model_monitoring/` |
@@ -61,10 +61,14 @@ Settings are in `static/model_config.yaml`.
   Triggers 3 to 5 come from last month's monitoring and respect the 3-month cooldown. Only monitoring rows about the current champion count: outcomes arrive 6 months after scoring, so a performance alert can describe a model that has already been replaced. Such alerts stay in the monitoring table for the record but do not retrain the current model. Monitoring stores each flag separately (`psi_flag`, `gini_flag`, `calibration_flag`, `coverage_flag`), and the gate logs which one caused a retrain. Monthly retraining is a launch setting: a training run takes about 20 seconds, and every new model still has to beat the champion by 0.01 OOT AUC to be promoted, so a new launch is watched closely without swapping models on noise. Once the model is stable, governance can raise the cadence to every 6 months to reduce model churn and sign-off work; the drift triggers keep working either way.
 - **Feature drift:** each month, every model input is compared with the model's OOT rows using CSI (the PSI formula applied to one feature) and written to `datamart/gold/model_monitoring/feature_drift/`. CSI is a warning that explains score drift; it does not trigger retraining on its own, because with about 50 inputs one of them crossing a line by chance is likely.
 - **Calibration:** after the model is chosen, Platt scaling (a one-input logistic regression on the score) is fitted on the model-selection holdout. It is kept only if it lowers the Brier score on the out-of-time promotion set (the mean squared gap between probability and outcome; lower is better). It never changes the order of applicants, so AUC and Gini are unaffected. The artefact records both Brier scores and the decision.
-- **Shadow models:** the champion's runner-up (the other model type trained on the same date, named for example `credit_model_2024_01_01_xgboost_runner_up`) and any challenger that was not promoted score every month's applicants, but their scores are never used. When the labels arrive, monitoring compares their pooled live Gini with the champion's on the same applicants. A shadow ahead by 0.02 or more over 3 cohorts, while that champion is still in production, sets `shadow_flag`, which calls for a promotion review.
+- **Shadow models:** the champion's runner-up (the other model type trained on the same date, named after the champion with the other family code, for example `credit_model_2024_01_01_logreg_<fit id>_runner_up`) and the latest challenger that was not promoted score every month's applicants, but their scores are never used. When the labels arrive, monitoring compares them with the champion on the same applicants in two ways:
+  - **per model** (`shadow_flag`): one shadow model ahead by 0.02 or more in pooled Gini over 3 cohorts, while that champion is still in production. This needs the same shadow for 3 months, so it works with a slower cadence;
+  - **per role** (`role_flag`, rows with `metric_type = shadow_role`): over the latest 3 months, whatever model filled the role, the runner-up or the rejected challenger was ahead of the champion every month and by 0.02 on average. This works with monthly retraining. A runner-up flag questions the model-family choice; a rejected-challenger flag suggests the 0.01 promotion rule is too strict.
+
+  Both call for a promotion review, not an automatic switch.
 - **Explanations:** every prediction carries `reason_1` to `reason_3`, the inputs that pushed that applicant's risk up the most. For logistic regression this is coefficient × standardised value; for XGBoost it is the model's built-in SHAP values. The artefact also stores each input's average contribution on OOT (`feature_importance`).
 - **Data checks:** training stops if there are no labelled loans, only one label class, labels other than 0/1 or duplicate loans. Inference stops if a model column is missing from the feature store, a customer appears twice, or a score is not a probability between 0 and 1. After saving, training reloads the model file and confirms it reproduces the same OOT scores. A failed check fails the Airflow task, so nothing is written from broken input.
-- **Lineage:** each artefact records the Python and package versions, the training config and its hash, and a fingerprint of the exact loans and labels used, so a model can be traced and a rerun checked against it.
+- **Lineage:** each artefact records the Python and package versions, the training config and its hash, and a fingerprint of the exact loans and labels used, so a model can be traced and a rerun checked against it. Each artefact also stores the label and feature partitions it read and the exact `loan_id`s in train, holdout and OOT, so the run can be rebuilt.
 
 ## Features
 
@@ -88,7 +92,15 @@ Left out on purpose: names, SSNs and other personal identifiers; `clickstream_da
 | --- | --- | --- |
 | Target leakage | Using information about this loan's repayment | Features come only from the attribute, financial and clickstream tables dated on the application date. The loan file is used only to build the label. Clickstream uses activity strictly before the application date. |
 | Train-test contamination | Imputation, scaling, encoding or pruning fitted on holdout or OOT rows | Imputation, scaling and one-hot encoding sit inside the scikit-learn pipeline and are fitted on the training split only. Feature pruning and hyperparameter tuning also use the training split only. The model-selection holdout picks the model type; OOT decides promotion and whether calibration is kept, never the model type. |
+| Cleaning rules (assumption) | Valid ranges chosen while looking at every month | The ranges in `static/valid_ranges.yaml` and the 30x income rule were set by looking at the whole file, then applied unchanged to every month as fixed business rules. No statistic is learned from later months at run time, but the thresholds themselves saw all months. Treated as an assumption; a governance review would refit them on training months only, for example if the income range shifts. |
 | Temporal leakage | Training on default labels that were not yet known | A model trained on date T uses only labels observed by T, OOT is the newest label months, and a model never scores months before its training date. Unit tests cover all three. |
+
+## Future work
+
+- **Fallback model without clickstream.** Train a second model that leaves out clickstream every month and keep it ready, so a lost source can be replaced the same day. Today the coverage trigger retrains when a source stops, which covers the gap but only after the fact.
+- **Limit on one source's influence (governance).** Flag a model for review when one data source carries a large share of its permutation importance. In the 2024-01 model, shuffling the clickstream averages costs 0.143 OOT Gini, about three times the next feature.
+- **Refit cleaning thresholds on training months only** (see the cleaning-rules assumption above).
+- **Rolling time-based validation** for choosing the model family, which gives several holdout scores with a spread instead of one.
 
 ## Deployment
 
@@ -107,6 +119,17 @@ Left out on purpose: names, SSNs and other personal identifiers; `clickstream_da
 **Rollback.** Every model stays in `model_bank/`. To roll back, add a row to `model_registry.csv` that promotes the previous version with reason `rollback`; inference uses the latest promoted model from the next run.
 
 **Alerts.** A failed task, including a failed data check, is retried once and then shows as failed in Airflow. In production the same failure, a `retrain_flag` or a `shadow_flag` would also send an email or Slack message through Airflow's failure callbacks.
+
+## Running the notebook
+
+The pipeline runs only in Docker and needs nothing else. `notebooks/model_exploration.ipynb` is for exploring the trained models after a run. It loads the saved models, which only open with the same scikit-learn and XGBoost versions as the container, so it needs its own virtual environment (not part of the pipeline or the zip):
+
+```bash
+python -m venv .venv
+.venv/Scripts/python -m pip install pandas==2.1.4 numpy==1.26.4 scikit-learn==1.6.1 xgboost==2.1.4 matplotlib==3.10.0 "PyYAML>=6,<7" python-dateutil pyarrow==17.0.0 shap==0.46.0 ipykernel nbconvert
+```
+
+Open the notebook with the `.venv` kernel (on macOS or Linux the path is `.venv/bin/python`).
 
 ## Tests
 
