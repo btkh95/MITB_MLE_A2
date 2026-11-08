@@ -207,12 +207,56 @@ def performance_row(snapshot_date_str, config):
     }
 
 
+def role_rows(snapshot_date_str, current_rows, config):
+    """Shadow comparison by role, so it works however often the models change.
+
+    The per-model shadow flag needs one shadow model to be scored for several months; with monthly
+    retraining each shadow is replaced within a month. Here the latest gini_window_months monitoring
+    months are pooled by role (the champion's runner-up, or the latest rejected challenger),
+    whatever model filled the role, and each month's shadow Gini is compared with the champion's
+    on the same applicants. role_flag: the role was ahead in every month and by
+    shadow_min_gini_gain on average. A runner-up flag questions the model-family choice; a
+    rejected-challenger flag suggests the promotion rule is too strict. Promotion review only.
+    """
+    window = config["monitoring"]["gini_window_months"]
+    months = [pd.DataFrame(current_rows)]
+    months += [mu.read_monitoring(mu.shift_months(snapshot_date_str, -k)) for k in range(1, window)]
+    gaps = {}
+    for table in months:
+        if table.empty or "metric_type" not in table:
+            continue
+        champion = table[table["metric_type"] == "performance"]
+        shadows = table[table["metric_type"] == "shadow"]
+        if champion.empty or shadows.empty:
+            continue
+        for _, row in shadows.iterrows():
+            role = "runner_up" if row["shadow_model"].endswith("_runner_up") else "rejected_challenger"
+            gaps.setdefault(role, []).append(float(row["gini"] - champion["gini"].iloc[0]))
+    cohort = next((r["cohort_date"] for r in current_rows if r["metric_type"] == "performance"), None)
+    rows = []
+    for role, values in gaps.items():
+        full = len(values) == window
+        rows.append({
+            "metric_type": "shadow_role",
+            "cohort_date": cohort,
+            "shadow_model": role,
+            "months_compared": len(values),
+            "months_ahead": int(sum(v > 0 for v in values)),
+            "mean_gini_gap": float(np.mean(values)),
+            "role_flag": bool(full and all(v > 0 for v in values)
+                              and np.mean(values) >= config["monitoring"]["shadow_min_gini_gain"]),
+            "retrain_flag": False,
+        })
+    return rows
+
+
 def main(snapshot_date_str):
     config = mu.load_config()
     stability, drift = stability_row(snapshot_date_str, config)
     performance = performance_row(snapshot_date_str, config)
     rows = [r for r in [stability, performance] if r]
     rows += shadow_rows(snapshot_date_str, performance, config)
+    rows += role_rows(snapshot_date_str, rows, config)
     if not rows:
         print("nothing to monitor on", snapshot_date_str)
         return
