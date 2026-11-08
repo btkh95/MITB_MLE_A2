@@ -12,8 +12,11 @@ logs/
 __pycache__/
 *.py[cod]
 
-# Docs folder (personal notes, report and slide files)
-docs/
+# Docs folder: personal notes, report and slide files stay local;
+# only the architecture diagram and the mascot are shared
+docs/*
+!docs/pipeline.drawio
+!docs/mascot/
 
 # Local environment settings
 .env
