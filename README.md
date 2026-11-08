@@ -70,6 +70,53 @@ Settings are in `static/model_config.yaml`.
 - **Data checks:** training stops if there are no labelled loans, only one label class, labels other than 0/1 or duplicate loans. Inference stops if a model column is missing from the feature store, a customer appears twice, or a score is not a probability between 0 and 1. After saving, training reloads the model file and confirms it reproduces the same OOT scores. A failed check fails the Airflow task, so nothing is written from broken input.
 - **Lineage:** each artefact records the Python and package versions, the training config and its hash, and a fingerprint of the exact loans and labels used, so a model can be traced and a rerun checked against it. Each artefact also stores the label and feature partitions it read and the exact `loan_id`s in train, holdout and OOT, so the run can be rebuilt.
 
+## Model refresh SOP
+
+How people run, review and change the model in production. The pipeline does the automatic parts; this section says who acts on them and who approves.
+
+**Roles**
+
+| Role | Responsible for |
+| --- | --- |
+| Model owner (data scientist) | Monthly monitoring review, investigating alerts, proposing model changes |
+| Data engineer | Source data, pipeline runs, failed tasks and data checks |
+| Model risk / validation | Independent review and sign-off before a new model family or a manual change goes live |
+| Credit risk / business owner | Approval cut-offs, product and policy changes, sign-off on model-family changes |
+
+**Monthly routine**
+
+1. On the 1st, the DAG runs automatically: source checks, data stages, training (monthly at launch), promotion, scoring, monitoring and charts.
+2. Within 3 working days, the model owner reviews `datamart/gold/model_monitoring/charts/` (Gini, PSI and CSI, calibration, shadow and per-model charts) and the monitoring table, and records "no action" or the action taken.
+3. Any flag below is handled as shown. Every decision is recorded in `model_bank/model_registry.csv` or the monitoring log.
+
+**Trigger, action and approval**
+
+| Trigger | What the pipeline does | What people do | Who approves going live |
+| --- | --- | --- | --- |
+| Failed task or data check | Stops that month; nothing is written from broken input | Data engineer fixes the source or the code and reruns the month | Model owner confirms the rerun |
+| Source coverage drop (`coverage_flag`, gate log) | Retrains at once without the lost inputs | Data engineer confirms whether the source is gone for good; model owner checks the new model | Model owner; model risk if the model family changes |
+| Score drift: PSI ≥ 0.25 (`psi_flag`) | Retrains next month (3-month cooldown) | Model owner investigates with feature CSI and the applicant mix | Model owner |
+| Performance: pooled Gini below 90% of baseline (`gini_flag`) | Retrains next month | Model owner checks for drift, data issues or a population change | Model owner |
+| Calibration gap ≥ 5 points (`calibration_flag`) | Retrains next month; training refits calibration | Model owner checks the default-rate trend and whether pricing or provisions are affected | Model owner; credit risk if pricing is affected |
+| Shadow ahead (`shadow_flag` or `role_flag`) | Nothing automatic | Model owner prepares a promotion review on pooled months | Model risk |
+| Business, policy or economic change | Nothing automatic | Business owner raises it; model owner assesses and may retrain manually | Model risk and business owner |
+
+**Promoting a model**
+
+The pipeline promotes a new model only when it beats the champion by at least 0.01 OOT AUC on the same loans, or when the champion lacks inputs current applicants have. It also needs a passed reload check and its verified pointer in `model_bank/fits/`. Before relying on a new model, the model owner checks its calibration and reason codes. A change of model family, or any manual promotion, needs model risk sign-off.
+
+**Rolling back**
+
+1. Pick the previous version from `model_registry.csv`. Every model stays in `model_bank/` under its own versioned name.
+2. Add a registry row that promotes it, with reason `rollback` and the date.
+3. Inference uses it from the next run. The model owner records why.
+
+**Cadence review**
+
+- At launch, retraining is monthly (`retrain_every_months: 1`).
+- After 6 months in production, governance decides whether to move to every 6 months, which reduces model churn and sign-off work. The coverage, drift, Gini and calibration triggers stay on either way, and the per-model shadow flag becomes usable.
+- Once a year, a full review of features, cleaning thresholds (see the assumption under leakage controls), fairness and this SOP.
+
 ## Features
 
 The model only sees an allowlist in `static/model_config.yaml`. Every input describes the applicant on the application date and is grouped by the credit question it answers.
