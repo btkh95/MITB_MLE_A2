@@ -263,6 +263,61 @@ class TestRetrainTriggers(TempStores):
             mu.MODEL_BANK, mu.MONITORING, mu.load_config = saved
 
 
+class TestVersionedFits(TempStores):
+    def test_names_with_a_fit_id_keep_date_family_and_shadow_naming(self):
+        version = mu.model_version("2024-01-01", "xgboost", "20261108T091702")
+        self.assertEqual(version, "credit_model_2024_01_01_xgboost_20261108T091702")
+        self.assertEqual(mu.version_date(version), "2024-01-01")
+        self.assertEqual(mu.version_family(version), "xgboost")
+        self.assertEqual(mu.runner_up_name(version, "logistic_regression"),
+                         "credit_model_2024_01_01_logreg_20261108T091702_runner_up")
+        # names from before fit ids still work
+        self.assertEqual(mu.runner_up_name("credit_model_2024_01_01_logreg", "xgboost"),
+                         "credit_model_2024_01_01_xgboost_runner_up")
+
+    def test_promotion_gets_the_latest_verified_fit_and_older_ones_stay(self):
+        saved = (mu.MODEL_BANK, mu.FITS)
+        mu.MODEL_BANK = self.tmp + "model_bank/"
+        mu.FITS = mu.MODEL_BANK + "fits/"
+        try:
+            with self.assertRaises(ValueError):
+                mu.verified_fit("2024-07-01")  # training never finished
+            first = mu.model_version("2024-07-01", "xgboost", "20261108T090000")
+            second = mu.model_version("2024-07-01", "xgboost", "20261108T100000")
+            for version in (first, second):
+                mu.save_artefact({"model_version": version})
+                mu.record_verified_fit("2024-07-01", version)
+            self.assertEqual(mu.verified_fit("2024-07-01"), second)
+            self.assertEqual(mu.load_artefact(first)["model_version"], first)  # rerun kept the old model
+        finally:
+            mu.MODEL_BANK, mu.FITS = saved
+
+
+class TestShadowRoles(TempStores):
+    def test_role_flag_needs_the_role_ahead_in_every_month_of_the_window(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("model_monitor", os.path.join(ROOT, "scripts", "model_monitor.py"))
+        monitor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(monitor)
+        saved = mu.MONITORING
+        mu.MONITORING = self.tmp + "monitoring/"
+        config = {"monitoring": {"gini_window_months": 3, "shadow_min_gini_gain": 0.02}}
+
+        def month(champion, challenger):
+            return [{"metric_type": "performance", "cohort_date": "x", "gini": champion},
+                    {"metric_type": "shadow", "shadow_model": f"credit_model_m_{challenger}", "gini": challenger}]
+        try:
+            os.makedirs(mu.MONITORING)
+            for date, rows in [("2024-08-01", month(0.60, 0.64)), ("2024-09-01", month(0.60, 0.63))]:
+                pd.DataFrame(rows).to_parquet(mu.MONITORING + "monitoring_" + mu.partition_suffix(date) + ".parquet")
+            ahead = monitor.role_rows("2024-10-01", month(0.60, 0.65), config)[0]
+            self.assertEqual((ahead["months_compared"], ahead["months_ahead"], ahead["role_flag"]), (3, 3, True))
+            behind = monitor.role_rows("2024-10-01", month(0.60, 0.58), config)[0]
+            self.assertFalse(behind["role_flag"])  # one month behind breaks the run
+        finally:
+            mu.MONITORING = saved
+
+
 class TestDriftAlertsFollowTheChampion(TempStores):
     def test_only_the_current_champions_alert_can_retrain(self):
         saved = (mu.MODEL_BANK, mu.MONITORING, mu.load_config)

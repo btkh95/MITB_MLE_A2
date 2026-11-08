@@ -160,8 +160,8 @@ def main(snapshot_date_str):
     print(importance.head(10).round(4).to_string(index=False))
 
     # --- save artefact ---
-    version = mu.model_version(snapshot_date_str, best_type)
-    mu.remove_models_trained_on(snapshot_date_str)
+    # every run gets its own name, so a rerun never overwrites the model that scored earlier months
+    version = mu.model_version(snapshot_date_str, best_type, mu.new_fit_id())
     # PSI reference = OOT scores: out-of-sample, so an overfit model's spread-out training
     # scores do not show up as drift in the very first month
     # CSI reference = the same OOT rows, as raw model inputs before preprocessing
@@ -196,7 +196,14 @@ def main(snapshot_date_str):
             "bad_rate": {"train": round(float(train["label"].mean()), 4),
                          "holdout": round(float(holdout["label"].mean()), 4),
                          "oot": round(float(oot["label"].mean()), 4)},
+            # what is needed to rebuild this run exactly: the partitions read and the loans in each split
+            "source_partitions": {
+                "label_store": sorted(data["label_snapshot_date"].unique().tolist()),
+                "feature_store": sorted(data["loan_start_date"].unique().tolist()),
+            },
         },
+        "split_loan_ids": {"train": sorted(train["loan_id"]), "holdout": sorted(holdout["loan_id"]),
+                           "oot": sorted(oot["loan_id"])},
         "reference_scores": reference_scores,
         "reference_features": reference_features,
     }
@@ -211,11 +218,16 @@ def main(snapshot_date_str):
 
     # human-readable summary next to the pickle
     summary = {k: v for k, v in artefact.items()
-               if k not in ["pipeline", "base_pipeline", "runner_up", "reference_scores", "reference_features"]}
+               if k not in ["pipeline", "base_pipeline", "runner_up", "reference_scores", "reference_features",
+                            "split_loan_ids"]}
     summary["runner_up"] = runner_up_type
     with open(directory + "metadata.json", "w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2, default=str)
     print("saved to:", directory)
+
+    # hand the exact verified model to promotion; written last, so it only exists for a complete run
+    mu.record_verified_fit(snapshot_date_str, version)
+    print("verified fit recorded:", version)
 
 
 if __name__ == "__main__":

@@ -359,35 +359,63 @@ def prune_features(spec, train, config):
 FAMILY_CODES = {"logistic_regression": "logreg", "xgboost": "xgboost"}
 
 
-def model_version(train_date_str, model_type):
-    """Model name = training date + model family, e.g. credit_model_2024_01_01_logreg."""
-    return f"credit_model_{partition_suffix(train_date_str)}_{FAMILY_CODES[model_type]}"
+FITS = MODEL_BANK + "fits/"
+
+
+def new_fit_id():
+    # UTC time of the training run, so rerunning a date never overwrites an earlier model
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+
+
+def model_version(train_date_str, model_type, fit_id=None):
+    """Model name = training date + model family (+ the run's fit id).
+
+    e.g. credit_model_2024_01_01_xgboost_20261108T091702. Names without a fit id (older runs)
+    stay valid everywhere: only the date parts and the family code are ever parsed.
+    """
+    name = f"credit_model_{partition_suffix(train_date_str)}_{FAMILY_CODES[model_type]}"
+    return f"{name}_{fit_id}" if fit_id else name
 
 
 def version_date(version):
-    # credit_model_2024_01_01_logreg -> 2024-01-01
+    # credit_model_2024_01_01_logreg(_fitid) -> 2024-01-01
     return "-".join(version[len("credit_model_"):].split("_")[:3])
 
 
+def version_family(version):
+    for model_type, code in FAMILY_CODES.items():
+        if f"_{code}" in version:
+            return model_type
+    raise ValueError(f"no model family in {version}")
+
+
 def runner_up_name(champion_version, runner_up_type):
-    """Shadow name for the champion's runner-up, e.g. credit_model_2024_01_01_xgboost_runner_up."""
-    date = version_date(champion_version)
-    return model_version(date, runner_up_type) + "_runner_up"
+    """Shadow name for the champion's runner-up: the champion's name with the other family code.
+
+    credit_model_2024_01_01_xgboost_20261108T091702 -> credit_model_2024_01_01_logreg_20261108T091702_runner_up
+    """
+    champion_code = FAMILY_CODES[version_family(champion_version)]
+    return champion_version.replace(f"_{champion_code}", f"_{FAMILY_CODES[runner_up_type]}", 1) + "_runner_up"
 
 
-def version_trained_on(train_date_str):
-    """The model saved for a training date (one per date: the winner of that date's comparison)."""
-    paths = glob.glob(MODEL_BANK + "credit_model_" + partition_suffix(train_date_str) + "_*/model.pkl")
-    if len(paths) != 1:
-        raise ValueError(f"expected one model trained on {train_date_str}, found {len(paths)}")
-    return os.path.basename(os.path.dirname(paths[0]))
+def record_verified_fit(train_date_str, version):
+    """After the reload check passes, point this training date at the exact model to promote."""
+    import json
+    os.makedirs(FITS, exist_ok=True)
+    path = FITS + partition_suffix(train_date_str) + ".json"
+    with open(path + ".tmp", "w", encoding="utf-8") as file:
+        json.dump({"train_date": train_date_str, "model_version": version}, file)
+    os.replace(path + ".tmp", path)  # atomic: promotion never reads a half-written pointer
 
 
-def remove_models_trained_on(train_date_str):
-    # retraining a date replaces its model, even if a different family wins this time
-    import shutil
-    for path in glob.glob(MODEL_BANK + "credit_model_" + partition_suffix(train_date_str) + "_*"):
-        shutil.rmtree(path)
+def verified_fit(train_date_str):
+    """The model verified by the latest training run for this date (what promotion evaluates)."""
+    import json
+    path = FITS + partition_suffix(train_date_str) + ".json"
+    if not os.path.exists(path):
+        raise ValueError(f"no verified model for {train_date_str}: training did not finish its reload check")
+    with open(path, encoding="utf-8") as file:
+        return json.load(file)["model_version"]
 
 
 def save_artefact(artefact):
