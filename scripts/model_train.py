@@ -69,21 +69,22 @@ def tune(pipeline, model_type, X, y, random_state):
     return search.best_estimator_, search.best_params_
 
 
-def calibrate(pipeline, features, val, oot):
-    """Platt scaling fitted on validation; kept only if it lowers the Brier score on OOT.
+def calibrate(pipeline, features, holdout, oot):
+    """Platt scaling fitted on the model-selection holdout; kept only if it lowers the Brier
+    score on the out-of-time promotion set (so OOT also decides this).
 
     Platt scaling is a one-input logistic regression on the model's score. It only stretches
     or shifts the scores, so the order of applicants (and AUC/Gini) stays the same.
     Brier score = mean of (probability - outcome)^2, lower is better.
     """
     calibrated = CalibratedClassifierCV(FrozenEstimator(pipeline), method="sigmoid")
-    calibrated.fit(mu.prepare_X(val, features), val["label"])
+    calibrated.fit(mu.prepare_X(holdout, features), holdout["label"])
 
     X_oot = mu.prepare_X(oot, features)
     raw = pipeline.predict_proba(X_oot)[:, 1]
     adjusted = calibrated.predict_proba(X_oot)[:, 1]
     report = {
-        "method": "platt (sigmoid) on validation",
+        "method": "platt (sigmoid) on holdout, kept if OOT Brier improves",
         "brier_oot_raw": round(float(brier_score_loss(oot["label"], raw)), 4),
         "brier_oot_calibrated": round(float(brier_score_loss(oot["label"], adjusted)), 4),
         "mean_prediction_oot_raw": round(float(raw.mean()), 4),
@@ -101,8 +102,10 @@ def main(snapshot_date_str):
     # --- data known at training time ---
     data = mu.load_training_data(snapshot_date_str)
     mu.check_training_data(data)
-    train, val, oot = mu.split_train_val_oot(data, config)
-    for name, rows in [("train", train), ("val", val), ("oot", oot)]:
+    # train: fitting (3-fold CV inside it for tuning); holdout: model-selection holdout;
+    # oot: out-of-time promotion set (2 newest label months)
+    train, holdout, oot = mu.split_train_holdout_oot(data, config)
+    for name, rows in [("train", train), ("holdout", holdout), ("oot", oot)]:
         print(f"{name:5} rows: {len(rows):5}  bad rate: {rows['label'].mean():.3f}  "
               f"applications: {rows['loan_start_date'].min()} to {rows['loan_start_date'].max()}")
 
@@ -125,7 +128,7 @@ def main(snapshot_date_str):
         best, params = tune(pipeline, model_type, mu.prepare_X(train, features), train["label"], random_state)
 
         scores = {}
-        for name, rows in [("train", train), ("val", val), ("oot", oot)]:
+        for name, rows in [("train", train), ("holdout", holdout), ("oot", oot)]:
             proba = best.predict_proba(mu.prepare_X(rows, features))[:, 1]
             auc = roc_auc_score(rows["label"], proba)
             scores[f"auc_{name}"] = round(float(auc), 4)
@@ -133,12 +136,13 @@ def main(snapshot_date_str):
         print(model_type, params, scores)
         candidates[model_type] = {"pipeline": best, "features": features, "params": params, "scores": scores}
 
-    # selection rule: highest validation Gini, with a tie-break that prefers the simpler model
-    # when the gap is within select_tie_margin. Each candidate is tuned by CV on train, the
-    # winner is picked on val, and OOT is only reported, so gini_oot stays an unbiased
-    # estimate and a fair baseline for monitoring.
+    # selection rule: highest Gini on the model-selection holdout, with a tie-break that prefers
+    # the simpler model when the gap is within select_tie_margin. Each candidate is tuned by CV
+    # on train and the winner is picked on the holdout. OOT plays no part in this choice; it is
+    # used later for the calibration decision and for promotion, which makes gini_oot (the
+    # monitoring baseline) slightly optimistic.
     best_type, selection_reason = mu.select_model(
-        {t: c["scores"]["gini_val"] for t, c in candidates.items()},
+        {t: c["scores"]["gini_holdout"] for t, c in candidates.items()},
         simplest_first=["logistic_regression", "xgboost"],
         tie_margin=config["training"]["select_tie_margin"])
     best = candidates[best_type]
@@ -146,7 +150,7 @@ def main(snapshot_date_str):
     runner_up_type = next(t for t in candidates if t != best_type)
 
     # --- calibration: make the probabilities match observed default rates ---
-    final_pipeline, calibration = calibrate(best["pipeline"], best["features"], val, oot)
+    final_pipeline, calibration = calibrate(best["pipeline"], best["features"], holdout, oot)
     print("calibration:", calibration)
 
     # --- explanations: which inputs drive the score, measured on OOT ---
@@ -188,9 +192,9 @@ def main(snapshot_date_str):
             "train_date": snapshot_date_str,
             "label_months": [data["label_snapshot_date"].min(), data["label_snapshot_date"].max()],
             "oot_label_months": sorted(oot["label_snapshot_date"].unique().tolist()),
-            "rows": {"train": len(train), "val": len(val), "oot": len(oot)},
+            "rows": {"train": len(train), "holdout": len(holdout), "oot": len(oot)},
             "bad_rate": {"train": round(float(train["label"].mean()), 4),
-                         "val": round(float(val["label"].mean()), 4),
+                         "holdout": round(float(holdout["label"].mean()), 4),
                          "oot": round(float(oot["label"].mean()), 4)},
         },
         "reference_scores": reference_scores,

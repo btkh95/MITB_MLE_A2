@@ -43,7 +43,7 @@ def main(snapshot_date_str):
         else:
             # score both on the challenger's OOT set (newest mature labels)
             data = mu.load_training_data(snapshot_date_str)
-            _, _, oot = mu.split_train_val_oot(data, config)
+            _, _, oot = mu.split_train_holdout_oot(data, config)
             proba = champion["pipeline"].predict_proba(mu.prepare_X(oot, champion["features"]))[:, 1]
             row["champion_oot_auc"] = round(float(roc_auc_score(oot["label"], proba)), 4)
             gain = row["challenger_oot_auc"] - row["champion_oot_auc"]

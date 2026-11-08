@@ -99,18 +99,27 @@ def load_training_data(train_date_str):
     return data
 
 
-def split_train_val_oot(data, config):
-    """OOT = newest label months; the earlier loans split into train and validation."""
+def split_train_holdout_oot(data, config):
+    """Split labelled loans into train, the model-selection holdout and the out-of-time promotion set.
+
+    oot = the newest label months (out-of-time promotion set: champion vs challenger, and whether
+    calibration is kept). The earlier loans split, stratified by label, into train (fitting, with
+    3-fold cross-validation inside it for tuning) and holdout (model-selection holdout: picks
+    logistic regression or XGBoost, and fits the Platt scaling).
+    """
     from sklearn.model_selection import train_test_split
 
+    # train_test_split picks rows by position, so sort by the unique loan_id first: the same loans
+    # then always land in the same split, whatever order the label and feature files were read in
+    data = data.sort_values("loan_id", kind="mergesort").reset_index(drop=True)
     label_months = sorted(data["label_snapshot_date"].unique())
     oot_months = label_months[-config["training"]["oot_label_months"]:]
     oot = data[data["label_snapshot_date"].isin(oot_months)]
     earlier = data[~data["label_snapshot_date"].isin(oot_months)]
-    train, val = train_test_split(earlier, test_size=config["training"]["validation_ratio"],
-                                  random_state=config["training"]["random_state"],
-                                  stratify=earlier["label"])
-    return train, val, oot
+    train, holdout = train_test_split(earlier, test_size=config["training"]["holdout_ratio"],
+                                      random_state=config["training"]["random_state"],
+                                      stratify=earlier["label"])
+    return train, holdout, oot
 
 
 #################
@@ -284,24 +293,24 @@ def information_value(values, label, bins=10):
     return float(np.sum((good - bad) * np.log(good / bad)))
 
 
-def select_model(val_gini, simplest_first, tie_margin):
-    """Pick the model type to keep, using validation Gini only (never OOT).
+def select_model(holdout_gini, simplest_first, tie_margin):
+    """Pick the model type to keep, using the model-selection holdout Gini only (never OOT).
 
-    val_gini: {model_type: validation Gini}. simplest_first: model types ordered from the
-    simplest to the most complex. The highest validation Gini wins, unless a simpler model
+    holdout_gini: {model_type: holdout Gini}. simplest_first: model types ordered from the
+    simplest to the most complex. The highest holdout Gini wins, unless a simpler model
     is within tie_margin of it; then the simplest such model wins, because a gap that small
-    is within the noise of a ~500-row validation set and the simpler model is easier to
+    is within the noise of a ~500-row holdout and the simpler model is easier to
     explain and less prone to overfit. Returns (model_type, reason).
     """
-    top = max(val_gini.values())
-    best = max(val_gini, key=val_gini.get)
+    top = max(holdout_gini.values())
+    best = max(holdout_gini, key=holdout_gini.get)
     for model_type in simplest_first:
-        if model_type in val_gini and val_gini[model_type] >= top - tie_margin:
+        if model_type in holdout_gini and holdout_gini[model_type] >= top - tie_margin:
             if model_type == best:
-                return model_type, "highest validation Gini"
-            return model_type, (f"within {tie_margin} of the best validation Gini "
+                return model_type, "highest holdout Gini"
+            return model_type, (f"within {tie_margin} of the best holdout Gini "
                                 f"({best} {top:.4f}); simpler model preferred")
-    return best, "highest validation Gini"
+    return best, "highest holdout Gini"
 
 
 def prune_features(spec, train, config):

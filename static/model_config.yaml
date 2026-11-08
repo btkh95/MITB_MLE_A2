@@ -8,7 +8,8 @@ training:
   retrain_cooldown_months: 3
   # newest label months held out as out-of-time (OOT) test
   oot_label_months: 2
-  validation_ratio: 0.2
+  # model-selection holdout: share of the older loans held out to choose the model family
+  holdout_ratio: 0.2
   random_state: 55
   # drop a feature when this share of the current month's applicants lack it
   max_missing_share: 0.5
@@ -16,7 +17,7 @@ training:
   min_information_value: 0.02
   # of two numeric features correlated above this (Spearman), keep the more informative one
   max_correlation: 0.9
-  # model choice: if a simpler model's validation Gini is within this of the best one, keep
+  # model choice: if a simpler model's holdout Gini is within this of the best one, keep
   # the simpler model (logistic regression before XGBoost); a smaller gap is noise on ~500 rows
   select_tie_margin: 0.01
 

@@ -68,16 +68,30 @@ class TestSplit(unittest.TestCase):
     def test_oot_is_the_newest_label_months_only(self):
         months = ["2024-03-01", "2024-04-01", "2024-05-01", "2024-06-01"]
         data = pd.DataFrame({"label_snapshot_date": np.repeat(months, 50),
-                             "label": np.tile([0, 1], 100), "row": range(200)})
-        config = {"training": {"oot_label_months": 2, "validation_ratio": 0.2, "random_state": 1}}
-        train, val, oot = mu.split_train_val_oot(data, config)
+                             "label": np.tile([0, 1], 100), "row": range(200),
+                             "loan_id": [f"L{i:03d}" for i in range(200)]})
+        config = {"training": {"oot_label_months": 2, "holdout_ratio": 0.2, "random_state": 1}}
+        train, holdout, oot = mu.split_train_holdout_oot(data, config)
 
         self.assertEqual(sorted(oot["label_snapshot_date"].unique()), ["2024-05-01", "2024-06-01"])
-        for part in (train, val):
+        for part in (train, holdout):
             self.assertTrue((part["label_snapshot_date"] < "2024-05-01").all())
-        rows = [set(p["row"]) for p in (train, val, oot)]
+        rows = [set(p["row"]) for p in (train, holdout, oot)]
         self.assertFalse(rows[0] & rows[1] or rows[0] & rows[2] or rows[1] & rows[2])
         self.assertEqual(sum(len(r) for r in rows), 200)
+
+
+    def test_split_membership_does_not_depend_on_row_order(self):
+        rng = np.random.default_rng(3)
+        months = ["2024-01-01", "2024-02-01", "2024-03-01", "2024-04-01", "2024-05-01"]
+        data = pd.DataFrame({"loan_id": [f"L{i:04d}" for i in range(500)],
+                             "label_snapshot_date": np.repeat(months, 100),
+                             "label": rng.integers(0, 2, 500)})
+        config = {"training": {"oot_label_months": 2, "holdout_ratio": 0.2, "random_state": 55}}
+        reference = [set(part["loan_id"]) for part in mu.split_train_holdout_oot(data, config)]
+        for order in (data.iloc[::-1], data.sample(frac=1, random_state=7)):
+            shuffled = [set(part["loan_id"]) for part in mu.split_train_holdout_oot(order, config)]
+            self.assertEqual(shuffled, reference)
 
 
 class TestStabilityIndices(unittest.TestCase):
@@ -160,7 +174,7 @@ class TestModelSelection(unittest.TestCase):
     def test_complex_model_wins_a_clear_gap(self):
         chosen, reason = mu.select_model({"logistic_regression": 0.5375, "xgboost": 0.6226}, self.ORDER, 0.01)
         self.assertEqual(chosen, "xgboost")
-        self.assertEqual(reason, "highest validation Gini")
+        self.assertEqual(reason, "highest holdout Gini")
 
 
 class TestDataChecks(unittest.TestCase):
