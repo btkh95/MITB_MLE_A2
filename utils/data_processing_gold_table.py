@@ -120,7 +120,7 @@ def process_fe_fin_gold_table(snapshot_date_str, silver_fe_fin_directory, gold_f
     df = df.withColumn("Disposable_Income",
         col("Monthly_Inhand_Salary") - col("Total_EMI_per_month") - col("Amount_invested_monthly"))
 
-    # augment data: domain ratios adopted from a classmate's datamart (Tan Yin Yun, A1)
+    # augment data: credit exposure ratios
     # total financial products held
     df = df.withColumn("Num_Fin_Pdts",
         col("Num_Bank_Accounts") + col("Num_Credit_Card") + col("Num_of_Loan"))
@@ -133,6 +133,11 @@ def process_fe_fin_gold_table(snapshot_date_str, silver_fe_fin_directory, gold_f
     # average payment delay per loan
     df = df.withColumn("Loan_Extent",
         F.when(col("Num_of_Loan") > 0, col("Delay_from_due_date") / col("Num_of_Loan")))
+
+    # late payments per loan held before applying: the same 12 late payments mean more
+    # over 2 loans than over 6. No loans -> null, not a divide-by-zero.
+    df = df.withColumn("Delayed_Payments_per_Loan",
+        F.when(col("Num_of_Loan") > 0, col("Num_of_Delayed_Payment") / col("Num_of_Loan")))
 
     # augment data: count each loan type, preserving repeated loans and unknown lists
     # Fixed categories from static/loan_types.yaml keep the schema consistent between monthly partitions.

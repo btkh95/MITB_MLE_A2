@@ -18,6 +18,7 @@ from dateutil.relativedelta import relativedelta
 LABEL_STORE = "datamart/gold/label_store/"
 FEATURE_STORE = "datamart/gold/feature_store/joined/"
 PREDICTIONS = "datamart/gold/model_predictions/"
+SHADOW_PREDICTIONS = PREDICTIONS + "shadow/"
 MONITORING = "datamart/gold/model_monitoring/"
 FEATURE_DRIFT = MONITORING + "feature_drift/"
 MODEL_BANK = "model_bank/"
@@ -110,6 +111,119 @@ def split_train_val_oot(data, config):
                                   random_state=config["training"]["random_state"],
                                   stratify=earlier["label"])
     return train, val, oot
+
+
+#################
+# Data checks   #
+#################
+# Each check stops the task with a clear message, so Airflow marks it failed instead of
+# training or scoring on broken input.
+
+def check_training_data(data):
+    problems = []
+    if data.empty:
+        problems.append("no labelled loans with features")
+    else:
+        if not data["label"].isin([0, 1]).all():
+            problems.append("labels other than 0/1")
+        if data["label"].nunique() < 2:
+            problems.append("only one label class")
+        if data["loan_id"].duplicated().any():
+            problems.append(f"{int(data['loan_id'].duplicated().sum())} duplicate loan_id rows")
+    if problems:
+        raise ValueError("training data check failed: " + "; ".join(problems))
+
+
+def check_applicants(applicants, features):
+    columns = sum(features.values(), [])
+    problems = []
+    missing = [c for c in columns if c not in applicants]
+    if missing:
+        problems.append(f"columns missing from the feature store: {missing}")
+    if applicants.duplicated(KEY_COLUMNS).any():
+        problems.append("duplicate Customer_ID rows for one snapshot date")
+    if problems:
+        raise ValueError("applicant data check failed: " + "; ".join(problems))
+
+
+def check_scores(scores):
+    scores = np.asarray(scores, dtype=float)
+    if not np.isfinite(scores).all() or (scores < 0).any() or (scores > 1).any():
+        raise ValueError("score check failed: probabilities must be finite and between 0 and 1")
+
+
+#################
+# Lineage       #
+#################
+
+def lineage(config, data):
+    """What produced a model: package versions, the config used and a fingerprint of the data."""
+    import hashlib
+    import json
+    import platform
+
+    import sklearn
+    import xgboost
+
+    config_text = json.dumps(config, sort_keys=True)
+    rows = data.sort_values("loan_id")[["loan_id", "label"]]
+    return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "python": platform.python_version(),
+        "packages": {"scikit-learn": sklearn.__version__, "xgboost": xgboost.__version__,
+                     "pandas": pd.__version__, "numpy": np.__version__},
+        "config_sha256": hashlib.sha256(config_text.encode()).hexdigest()[:16],
+        "config": config["training"],
+        # same loans and labels -> same fingerprint, so a rerun can be checked against this one
+        "training_data_sha256": hashlib.sha256(
+            pd.util.hash_pandas_object(rows, index=False).values.tobytes()).hexdigest()[:16],
+    }
+
+
+#################
+# Explanations  #
+#################
+
+def _readable(name):
+    # "numeric__Interest_Rate" -> "Interest_Rate"; "categorical__Credit_Mix_Bad" -> "Credit_Mix_Bad"
+    return name.split("__", 1)[-1]
+
+
+def contributions(pipeline, X):
+    """Each input's push on each applicant's score, on the model's log-odds scale.
+
+    Logistic regression: coefficient x standardised value. XGBoost: its built-in SHAP values
+    (pred_contribs), which split each score exactly into one part per input plus a baseline.
+    Positive = pushes towards default. Returns a DataFrame with one column per model input.
+    """
+    import xgboost as xgb
+
+    preprocess, model = pipeline.named_steps["preprocess"], pipeline.named_steps["model"]
+    matrix = preprocess.transform(X)
+    matrix = matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix, dtype=float)
+    names = [_readable(n) for n in preprocess.get_feature_names_out()]
+    if hasattr(model, "coef_"):
+        values = matrix * model.coef_[0]
+    else:
+        values = model.get_booster().predict(xgb.DMatrix(matrix), pred_contribs=True)[:, :-1]
+    return pd.DataFrame(values, columns=names, index=X.index)
+
+
+def reason_codes(pipeline, X, top_n=3):
+    """The top_n inputs that pushed each applicant's default risk up the most."""
+    contrib = contributions(pipeline, X)
+    names = np.array(contrib.columns)
+    order = np.argsort(-contrib.values, axis=1)[:, :top_n]
+    pushes_up = np.take_along_axis(contrib.values, order, axis=1) > 0
+    codes = np.where(pushes_up, names[order], None)
+    return pd.DataFrame(codes, columns=[f"reason_{i + 1}" for i in range(top_n)], index=X.index)
+
+
+def feature_importance(pipeline, X):
+    """Average size of each input's push across X (mean |contribution|), largest first."""
+    contrib = contributions(pipeline, X).abs().mean()
+    return (contrib.sort_values(ascending=False).rename("mean_abs_contribution")
+            .rename_axis("feature").reset_index())
 
 
 #################
@@ -232,8 +346,39 @@ def prune_features(spec, train, config):
 # Model bank    #
 #################
 
-def model_version(train_date_str):
-    return "credit_model_" + partition_suffix(train_date_str)
+# short model family codes used in model names
+FAMILY_CODES = {"logistic_regression": "logreg", "xgboost": "xgboost"}
+
+
+def model_version(train_date_str, model_type):
+    """Model name = training date + model family, e.g. credit_model_2024_01_01_logreg."""
+    return f"credit_model_{partition_suffix(train_date_str)}_{FAMILY_CODES[model_type]}"
+
+
+def version_date(version):
+    # credit_model_2024_01_01_logreg -> 2024-01-01
+    return "-".join(version[len("credit_model_"):].split("_")[:3])
+
+
+def runner_up_name(champion_version, runner_up_type):
+    """Shadow name for the champion's runner-up, e.g. credit_model_2024_01_01_xgboost_runner_up."""
+    date = version_date(champion_version)
+    return model_version(date, runner_up_type) + "_runner_up"
+
+
+def version_trained_on(train_date_str):
+    """The model saved for a training date (one per date: the winner of that date's comparison)."""
+    paths = glob.glob(MODEL_BANK + "credit_model_" + partition_suffix(train_date_str) + "_*/model.pkl")
+    if len(paths) != 1:
+        raise ValueError(f"expected one model trained on {train_date_str}, found {len(paths)}")
+    return os.path.basename(os.path.dirname(paths[0]))
+
+
+def remove_models_trained_on(train_date_str):
+    # retraining a date replaces its model, even if a different family wins this time
+    import shutil
+    for path in glob.glob(MODEL_BANK + "credit_model_" + partition_suffix(train_date_str) + "_*"):
+        shutil.rmtree(path)
 
 
 def save_artefact(artefact):
@@ -276,6 +421,28 @@ def champion_as_of(date_str, inclusive=True):
     if registry.empty:
         return None
     return registry.sort_values("decision_date").iloc[-1]["model_version"]
+
+
+def shadows_as_of(date_str):
+    """Models that score applicants alongside the champion without affecting decisions.
+
+    1. the champion's runner-up: the other model type trained on the same date
+    2. challengers trained after the champion that were not promoted
+    Returns a list of (shadow name, artefact version, artefact key holding the pipeline).
+    """
+    champion = champion_as_of(date_str)
+    if champion is None:
+        return []
+    registry = read_registry()
+    champion_type = registry.loc[registry["model_version"] == champion, "model_type"]
+    other = [t for t in FAMILY_CODES if champion_type.empty or t != champion_type.iloc[0]]
+    shadows = [(runner_up_name(champion, other[0]), champion, "runner_up")]
+    champion_date = registry.loc[registry["model_version"] == champion, "decision_date"].max()
+    rejected = registry[(registry["promoted"].astype(str) != "True") &
+                        (registry["decision_date"] > champion_date) &
+                        (registry["decision_date"] <= date_str)]
+    shadows += [(v, v, "pipeline") for v in rejected["model_version"]]
+    return shadows
 
 
 #################

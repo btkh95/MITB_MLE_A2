@@ -16,7 +16,7 @@ from utils import model_utils as mu
 
 def main(snapshot_date_str):
     config = mu.load_config()
-    challenger = mu.load_artefact(mu.model_version(snapshot_date_str))
+    challenger = mu.load_artefact(mu.version_trained_on(snapshot_date_str))
     champion_version = mu.champion_as_of(snapshot_date_str, inclusive=False)
 
     row = {

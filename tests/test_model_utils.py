@@ -163,23 +163,87 @@ class TestModelSelection(unittest.TestCase):
         self.assertEqual(reason, "highest validation Gini")
 
 
+class TestDataChecks(unittest.TestCase):
+    def test_training_data_with_one_class_or_duplicates_is_rejected(self):
+        good = pd.DataFrame({"loan_id": ["a", "b"], "label": [0, 1]})
+        mu.check_training_data(good)
+        with self.assertRaises(ValueError):
+            mu.check_training_data(good.assign(label=[0, 0]))
+        with self.assertRaises(ValueError):
+            mu.check_training_data(good.assign(loan_id=["a", "a"]))
+
+    def test_applicants_missing_a_model_column_are_rejected(self):
+        applicants = pd.DataFrame({"Customer_ID": ["C1"], "snapshot_date": ["2024-01-01"], "Age": [30]})
+        mu.check_applicants(applicants, {"numeric": ["Age"], "flags": [], "categorical": []})
+        with self.assertRaises(ValueError):
+            mu.check_applicants(applicants, {"numeric": ["Age", "Interest_Rate"], "flags": [], "categorical": []})
+
+    def test_scores_outside_zero_to_one_are_rejected(self):
+        mu.check_scores([0.1, 0.9])
+        for bad in ([0.1, np.nan], [0.1, 1.2], [-0.1, 0.5]):
+            with self.assertRaises(ValueError):
+                mu.check_scores(bad)
+
+
+class TestExplanations(unittest.TestCase):
+    def test_reason_codes_name_the_inputs_that_raise_risk(self):
+        from sklearn.compose import ColumnTransformer
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame({"risk": rng.normal(size=500), "noise": rng.normal(size=500)})
+        y = (X["risk"] + rng.normal(scale=0.3, size=500) > 0).astype(int)
+        pipeline = Pipeline([("preprocess", ColumnTransformer([("numeric", StandardScaler(), ["risk", "noise"])])),
+                             ("model", LogisticRegression())]).fit(X, y)
+
+        risky = pd.DataFrame({"risk": [3.0], "noise": [0.0]})
+        self.assertEqual(mu.reason_codes(pipeline, risky, top_n=1).iloc[0, 0], "risk")
+        safe = pd.DataFrame({"risk": [-3.0], "noise": [0.0]})
+        self.assertNotEqual(mu.reason_codes(pipeline, safe, top_n=1).iloc[0, 0], "risk")
+        self.assertEqual(mu.feature_importance(pipeline, X)["feature"].iloc[0], "risk")
+
+
+class TestLineage(unittest.TestCase):
+    def test_same_loans_give_the_same_fingerprint(self):
+        config = {"training": {"random_state": 1}}
+        data = pd.DataFrame({"loan_id": ["b", "a"], "label": [1, 0]})
+        first = mu.lineage(config, data)["training_data_sha256"]
+        self.assertEqual(first, mu.lineage(config, data.iloc[::-1])["training_data_sha256"])
+        self.assertNotEqual(first, mu.lineage(config, data.assign(label=[0, 0]))["training_data_sha256"])
+
+
 class TestChampion(TempStores):
     def setUp(self):
         super().setUp()
-        for date, promoted in [("2024-01-01", True), ("2024-07-01", True), ("2025-01-01", False)]:
-            mu.write_registry_row({"decision_date": date, "model_version": mu.model_version(date),
-                                   "promoted": promoted})
+        for date, model_type, promoted in [("2024-01-01", "logistic_regression", True),
+                                           ("2024-07-01", "xgboost", True),
+                                           ("2025-01-01", "xgboost", False)]:
+            mu.write_registry_row({"decision_date": date, "model_version": mu.model_version(date, model_type),
+                                   "model_type": model_type, "promoted": promoted})
+
+    def test_model_names_carry_date_and_family(self):
+        self.assertEqual(mu.model_version("2024-01-01", "logistic_regression"), "credit_model_2024_01_01_logreg")
+        self.assertEqual(mu.version_date("credit_model_2024_07_01_xgboost"), "2024-07-01")
+
+    def test_shadows_are_the_runner_up_and_later_rejected_challengers(self):
+        self.assertEqual(mu.shadows_as_of("2023-12-01"), [])
+        self.assertEqual([s[0] for s in mu.shadows_as_of("2024-03-01")],
+                         ["credit_model_2024_01_01_xgboost_runner_up"])
+        self.assertEqual([s[0] for s in mu.shadows_as_of("2025-01-01")],
+                         ["credit_model_2024_07_01_logreg_runner_up", "credit_model_2025_01_01_xgboost"])
 
     def test_no_champion_before_the_first_training(self):
         self.assertIsNone(mu.champion_as_of("2023-12-01"))
 
     def test_never_uses_a_model_trained_after_the_scoring_date(self):
-        self.assertEqual(mu.champion_as_of("2024-06-01"), "credit_model_2024_01_01")
-        self.assertEqual(mu.champion_as_of("2024-07-01"), "credit_model_2024_07_01")
-        self.assertEqual(mu.champion_as_of("2024-07-01", inclusive=False), "credit_model_2024_01_01")
+        self.assertEqual(mu.champion_as_of("2024-06-01"), "credit_model_2024_01_01_logreg")
+        self.assertEqual(mu.champion_as_of("2024-07-01"), "credit_model_2024_07_01_xgboost")
+        self.assertEqual(mu.champion_as_of("2024-07-01", inclusive=False), "credit_model_2024_01_01_logreg")
 
     def test_a_rejected_challenger_never_becomes_champion(self):
-        self.assertEqual(mu.champion_as_of("2025-06-01"), "credit_model_2024_07_01")
+        self.assertEqual(mu.champion_as_of("2025-06-01"), "credit_model_2024_07_01_xgboost")
 
 
 if __name__ == "__main__":

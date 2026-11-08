@@ -9,10 +9,12 @@ import json
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
+from sklearn.frozen import FrozenEstimator
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import brier_score_loss, roc_auc_score
 from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -67,12 +69,38 @@ def tune(pipeline, model_type, X, y, random_state):
     return search.best_estimator_, search.best_params_
 
 
+def calibrate(pipeline, features, val, oot):
+    """Platt scaling fitted on validation; kept only if it lowers the Brier score on OOT.
+
+    Platt scaling is a one-input logistic regression on the model's score. It only stretches
+    or shifts the scores, so the order of applicants (and AUC/Gini) stays the same.
+    Brier score = mean of (probability - outcome)^2, lower is better.
+    """
+    calibrated = CalibratedClassifierCV(FrozenEstimator(pipeline), method="sigmoid")
+    calibrated.fit(mu.prepare_X(val, features), val["label"])
+
+    X_oot = mu.prepare_X(oot, features)
+    raw = pipeline.predict_proba(X_oot)[:, 1]
+    adjusted = calibrated.predict_proba(X_oot)[:, 1]
+    report = {
+        "method": "platt (sigmoid) on validation",
+        "brier_oot_raw": round(float(brier_score_loss(oot["label"], raw)), 4),
+        "brier_oot_calibrated": round(float(brier_score_loss(oot["label"], adjusted)), 4),
+        "mean_prediction_oot_raw": round(float(raw.mean()), 4),
+        "mean_prediction_oot_calibrated": round(float(adjusted.mean()), 4),
+        "bad_rate_oot": round(float(oot["label"].mean()), 4),
+    }
+    report["applied"] = report["brier_oot_calibrated"] < report["brier_oot_raw"]
+    return (calibrated if report["applied"] else pipeline), report
+
+
 def main(snapshot_date_str):
     config = mu.load_config()
     random_state = config["training"]["random_state"]
 
     # --- data known at training time ---
     data = mu.load_training_data(snapshot_date_str)
+    mu.check_training_data(data)
     train, val, oot = mu.split_train_val_oot(data, config)
     for name, rows in [("train", train), ("val", val), ("oot", oot)]:
         print(f"{name:5} rows: {len(rows):5}  bad rate: {rows['label'].mean():.3f}  "
@@ -115,19 +143,40 @@ def main(snapshot_date_str):
         tie_margin=config["training"]["select_tie_margin"])
     best = candidates[best_type]
     print("selected:", best_type, "-", selection_reason)
+    runner_up_type = next(t for t in candidates if t != best_type)
+
+    # --- calibration: make the probabilities match observed default rates ---
+    final_pipeline, calibration = calibrate(best["pipeline"], best["features"], val, oot)
+    print("calibration:", calibration)
+
+    # --- explanations: which inputs drive the score, measured on OOT ---
+    oot_X = mu.prepare_X(oot, best["features"])
+    importance = mu.feature_importance(best["pipeline"], oot_X)
+    print("top inputs by mean contribution on OOT:")
+    print(importance.head(10).round(4).to_string(index=False))
 
     # --- save artefact ---
-    version = mu.model_version(snapshot_date_str)
+    version = mu.model_version(snapshot_date_str, best_type)
+    mu.remove_models_trained_on(snapshot_date_str)
     # PSI reference = OOT scores: out-of-sample, so an overfit model's spread-out training
     # scores do not show up as drift in the very first month
     # CSI reference = the same OOT rows, as raw model inputs before preprocessing
-    reference_features = mu.prepare_X(oot, best["features"]).reset_index(drop=True)
-    reference_scores = best["pipeline"].predict_proba(reference_features)[:, 1]
+    reference_features = oot_X.reset_index(drop=True)
+    reference_scores = final_pipeline.predict_proba(reference_features)[:, 1]
     artefact = {
         "model_version": version,
         "model_type": best_type,
         "selection_reason": selection_reason,
-        "pipeline": best["pipeline"],
+        # pipeline = what inference uses (calibrated if that helped); base_pipeline = the
+        # uncalibrated model, used for explanations because calibration does not change ranking
+        "pipeline": final_pipeline,
+        "base_pipeline": best["pipeline"],
+        "calibration": calibration,
+        # the losing model type runs in shadow: it scores applicants but never decides
+        "runner_up": {"model_type": runner_up_type, "pipeline": candidates[runner_up_type]["pipeline"],
+                      "features": candidates[runner_up_type]["features"]},
+        "feature_importance": importance.round(4).to_dict(orient="records"),
+        "lineage": mu.lineage(config, data),
         "features": best["features"],
         "dropped_features": dropped,
         # information value of every candidate feature on train, and why any were pruned
@@ -151,7 +200,8 @@ def main(snapshot_date_str):
 
     # human-readable summary next to the pickle
     summary = {k: v for k, v in artefact.items()
-               if k not in ["pipeline", "reference_scores", "reference_features"]}
+               if k not in ["pipeline", "base_pipeline", "runner_up", "reference_scores", "reference_features"]}
+    summary["runner_up"] = runner_up_type
     with open(directory + "metadata.json", "w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2, default=str)
     print("saved to:", directory)

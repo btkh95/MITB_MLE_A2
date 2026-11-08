@@ -5,6 +5,7 @@
 Stability: PSI of this month's prediction scores vs the model's OOT scores at training time,
 and CSI of each input feature vs the same OOT rows (written to model_monitoring/feature_drift/).
 Performance: predictions made label_lag_months ago, joined to the labels observed today.
+Shadow: the same live Gini for each shadow model, compared with the champion's.
 """
 
 import argparse
@@ -80,15 +81,66 @@ def stability_row(snapshot_date_str, config):
     return row, drift
 
 
-def scored_cohort(monitor_date_str, config):
+def read_shadow_predictions(date_str):
+    path = mu.SHADOW_PREDICTIONS + "shadow_predictions_" + mu.partition_suffix(date_str) + ".parquet"
+    return pd.read_parquet(path) if os.path.exists(path) else pd.DataFrame()
+
+
+def scored_cohort(monitor_date_str, config, reader=read_predictions):
     """Predictions made label_lag_months before monitor_date, joined to the labels observed on it."""
     cohort_date = mu.shift_months(monitor_date_str, -config["monitoring"]["label_lag_months"])
-    predictions = read_predictions(cohort_date)
+    predictions = reader(cohort_date)
     labels = mu.read_labels(monitor_date_str)
     if predictions.empty or labels.empty:
         return pd.DataFrame()
     labels = labels[labels["loan_start_date"] == cohort_date]
     return predictions.merge(labels[["Customer_ID", "label"]], on="Customer_ID", how="inner")
+
+
+def shadow_rows(snapshot_date_str, champion_row, config):
+    """Live Gini of each shadow model vs the champion on the same applicants.
+
+    Uses the same pooled window as the champion's retrain test. A shadow ahead by
+    shadow_min_gini_gain over a full window, while that champion is still in production,
+    raises shadow_flag: a promotion review in the SOP, not an automatic switch.
+    """
+    scored = scored_cohort(snapshot_date_str, config, read_shadow_predictions)
+    if scored.empty or champion_row is None:
+        return []
+    window_size = config["monitoring"]["gini_window_months"]
+    champion = champion_row["model_version"]
+    still_champion = mu.champion_as_of(snapshot_date_str) == champion
+    rows = []
+    for name, cohort in scored.groupby("shadow_model"):
+        if cohort["label"].nunique() < 2:
+            continue
+        window = [cohort]
+        for k in range(1, champion_row["cohorts_pooled"]):
+            earlier = scored_cohort(mu.shift_months(snapshot_date_str, -k), config, read_shadow_predictions)
+            earlier = earlier[earlier["shadow_model"] == name] if not earlier.empty else earlier
+            if earlier.empty:
+                break
+            window.append(earlier)
+        gini_pooled = gini_of(pd.concat(window, ignore_index=True))
+        gap = gini_pooled - champion_row["gini_pooled"]
+        rows.append({
+            "metric_type": "shadow",
+            "cohort_date": champion_row["cohort_date"],
+            "model_version": champion,
+            "shadow_model": name,
+            "n": len(cohort),
+            "mean_prediction": float(cohort["model_predictions"].mean()),
+            "bad_rate": float(cohort["label"].mean()),
+            "gini": float(gini_of(cohort)),
+            "gini_pooled": float(gini_pooled),
+            "cohorts_pooled": len(window),
+            "champion_gini_pooled": float(champion_row["gini_pooled"]),
+            "shadow_gini_gap": float(gap),
+            "shadow_flag": bool(gap >= config["monitoring"]["shadow_min_gini_gain"]
+                                and len(window) == window_size and still_champion),
+            "retrain_flag": False,
+        })
+    return rows
 
 
 def gini_of(scored):
@@ -144,7 +196,9 @@ def performance_row(snapshot_date_str, config):
 def main(snapshot_date_str):
     config = mu.load_config()
     stability, drift = stability_row(snapshot_date_str, config)
-    rows = [r for r in [stability, performance_row(snapshot_date_str, config)] if r]
+    performance = performance_row(snapshot_date_str, config)
+    rows = [r for r in [stability, performance] if r]
+    rows += shadow_rows(snapshot_date_str, performance, config)
     if not rows:
         print("nothing to monitor on", snapshot_date_str)
         return

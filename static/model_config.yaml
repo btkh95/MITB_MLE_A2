@@ -32,6 +32,8 @@ monitoring:
   # the Gini compared against that line pools this many latest monthly cohorts of the same
   # model (one cohort of ~500 loans is too noisy on its own)
   gini_window_months: 3
+  # shadow model: flag a promotion review when its pooled live Gini beats the champion's by this
+  shadow_min_gini_gain: 0.02
   # months between a prediction and its default label (label definition 30dpd_6mob)
   label_lag_months: 6
 
@@ -64,6 +66,7 @@ features:
     - Num_Fin_Pdts
     - Loans_per_Credit_Item
     - Loan_Extent
+    - Delayed_Payments_per_Loan
     - Loan_Auto_Loan
     - Loan_Credit_Builder_Loan
     - Loan_Debt_Consolidation_Loan

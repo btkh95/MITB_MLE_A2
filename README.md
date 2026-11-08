@@ -26,10 +26,10 @@ The backfill covers 31 monthly runs (2023-01 to 2025-07). Airflow runs one task 
 | Label store | `bronze_lms` → `silver_lms` → `gold_label_store` | `datamart/gold/label_store/` — loans reaching month on book 6 this month, labelled `30dpd_6mob` |
 | Feature store | bronze, silver and gold for attributes, financials and clickstream → `gold_feature_store` | `datamart/gold/feature_store/joined/` — one row per applicant, as of the application date |
 | Training gate | `model_train_gate` | Trains on the first training date (2024-01-01), every 6 months after that, or after a drift alert (minimum 3 months apart); otherwise skips training |
-| Training | `model_train` | Trains logistic regression and XGBoost on labels already observed at the run date, then keeps the one with the higher validation Gini, preferring logistic regression when the two are within 0.01 → `model_bank/credit_model_YYYY_MM_DD/` |
+| Training | `model_train` | Trains logistic regression and XGBoost on labels already observed at the run date, then keeps the one with the higher validation Gini, preferring logistic regression when the two are within 0.01. Calibrates the probabilities if that helps, and records feature importance and lineage → `model_bank/credit_model_YYYY_MM_DD_<family>/`, where the family is `logreg` or `xgboost` |
 | Promotion | `model_promote` | Champion/challenger decision logged to `model_bank/model_registry.csv` |
-| Inference | `model_inference` | Scores this month's applications with the current champion → `datamart/gold/model_predictions/` |
-| Monitoring | `model_monitor` | PSI of this month's scores and CSI of each input feature vs the model's out-of-time data at training, plus AUC, Gini, KS and actual vs predicted default rate for the applications scored 6 months ago → `datamart/gold/model_monitoring/` |
+| Inference | `model_inference` | Checks the input, scores this month's applications with the current champion and adds the top 3 reasons behind each score → `datamart/gold/model_predictions/`. Shadow models score the same applicants → `model_predictions/shadow/` |
+| Monitoring | `model_monitor` | PSI of this month's scores and CSI of each input feature vs the model's out-of-time data at training, plus AUC, Gini, KS and actual vs predicted default rate for the applications scored 6 months ago, and the same live Gini for each shadow model → `datamart/gold/model_monitoring/` |
 | Charts | `model_monitor_charts` | PNG charts and a CSV of every monitoring result → `datamart/gold/model_monitoring/charts/` |
 
 ## Model governance
@@ -41,8 +41,54 @@ Settings are in `static/model_config.yaml`.
 - **Features:** an explicit allowlist. A feature is dropped at training time when more than half of that month's applicants lack it. Clickstream data stops for applicants from July 2024, so later models drop those features. The remaining features are then pruned on the training split: a feature with information value below 0.02 is dropped as weak, and of two numeric features with Spearman correlation above 0.9 the less informative one is dropped. The artefact records every feature's information value and the reason for each drop.
 - **Promotion:** a new model replaces the champion when there is no champion, when the champion needs features current applicants lack, or when the new model's OOT AUC is at least 0.01 higher than the champion's on the same OOT data.
 - **Retraining triggers:** a scheduled refresh every 6 months; score PSI ≥ 0.25; or Gini below 90% of the model's OOT Gini at training time, measured on the latest 3 monthly cohorts of that model pooled together (one cohort of about 500 loans is too noisy on its own).
-- **Next step, not built:** shadow deployment. The runner-up model would also score each month's applicants without affecting decisions, and once their labels arrive 6 months later the two models' live Gini would be compared before deciding on promotion.
 - **Feature drift:** each month, every model input is compared with the model's OOT rows using CSI (the PSI formula applied to one feature) and written to `datamart/gold/model_monitoring/feature_drift/`. CSI is a warning that explains score drift; it does not trigger retraining on its own, because with about 50 inputs one of them crossing a line by chance is likely.
+- **Calibration:** after the model is chosen, Platt scaling (a one-input logistic regression on the score) is fitted on the validation set. It is kept only if it lowers the Brier score on OOT (the mean squared gap between probability and outcome; lower is better). It never changes the order of applicants, so AUC and Gini are unaffected. The artefact records both Brier scores and the decision.
+- **Shadow models:** the champion's runner-up (the other model type trained on the same date, named for example `credit_model_2024_01_01_xgboost_runner_up`) and any challenger that was not promoted score every month's applicants, but their scores are never used. When the labels arrive, monitoring compares their pooled live Gini with the champion's on the same applicants. A shadow ahead by 0.02 or more over 3 cohorts, while that champion is still in production, sets `shadow_flag`, which calls for a promotion review.
+- **Explanations:** every prediction carries `reason_1` to `reason_3`, the inputs that pushed that applicant's risk up the most. For logistic regression this is coefficient × standardised value; for XGBoost it is the model's built-in SHAP values. The artefact also stores each input's average contribution on OOT (`feature_importance`).
+- **Data checks:** training stops if there are no labelled loans, only one label class, labels other than 0/1 or duplicate loans. Inference stops if a model column is missing from the feature store, a customer appears twice, or a score is not a probability between 0 and 1. A failed check fails the Airflow task, so nothing is written from broken input.
+- **Lineage:** each artefact records the Python and package versions, the training config and its hash, and a fingerprint of the exact loans and labels used, so a model can be traced and a rerun checked against it.
+
+## Features
+
+The model only sees an allowlist in `static/model_config.yaml`. Every input describes the applicant on the application date and is grouped by the credit question it answers.
+
+| Question | Inputs | Why |
+| --- | --- | --- |
+| Have they paid late before? | `Delay_from_due_date`, `Num_of_Delayed_Payment`, `Delayed_Payments_per_Loan`, `Payment_of_Min_Amount`, `Credit_Mix` | Past repayment behaviour is the strongest predictor of future repayment. Late payments per loan separates a few late payments spread over many loans from the same number on one or two. |
+| Are they looking for more credit? | `Num_Credit_Inquiries`, `Changed_Credit_Limit`, `Num_Credit_Card`, `Num_Bank_Accounts` | Many recent applications or limit changes often come before financial stress. |
+| Can they afford it? | `Annual_Income`, `Monthly_Inhand_Salary`, `Outstanding_Debt`, `Total_EMI_per_month`, `EMI_to_Salary_Ratio`, `Debt_to_Income`, `Disposable_Income`, `Credit_Utilization_Ratio`, `Interest_Rate` | Ratios compare debt with income, so they mean the same thing at every income level. The interest rate other lenders charge reflects how risky they already judge the customer. |
+| How much credit do they hold? | `Num_of_Loan`, `listed_loan_count`, loan-type counts, `Num_Fin_Pdts`, `Loans_per_Credit_Item`, `Loan_Extent` | Several loans, or loans that outnumber bank and card products, point to heavy reliance on borrowing. |
+| How established are they? | `Age`, `Occupation`, `Credit_History_Months`, `Spending_Behaviour`, `Payments_Size` | A longer credit history and a stable profile carry less uncertainty. |
+| Online behaviour | `fe_1_mean` to `fe_20_mean`, `has_clickstream` | Average activity before the application. Only applicants up to June 2024 have it, so models trained later drop it automatically. |
+| Data quality | `*_invalid`, `*_missing`, `loan_count_suspicious` | A value that had to be cleaned can itself signal risk; pruning drops the flags that carry no signal. |
+
+Left out on purpose: names, SSNs and other personal identifiers; `clickstream_days`, which mostly measures how long ago the customer joined rather than their behaviour; `has_attributes` and `has_financials`, which are always 1; and everything in the loan file after the start date, because that is where the label comes from. Loan amount and tenure are also unused: every loan is 10,000 over 10 months, so they carry no information.
+
+## Leakage controls
+
+| Type | Risk in this data | Control |
+| --- | --- | --- |
+| Target leakage | Using information about this loan's repayment | Features come only from the attribute, financial and clickstream tables dated on the application date. The loan file is used only to build the label. Clickstream uses activity strictly before the application date. |
+| Train-test contamination | Imputation, scaling, encoding or pruning fitted on validation or OOT rows | Imputation, scaling and one-hot encoding sit inside the scikit-learn pipeline and are fitted on the training split only. Feature pruning and hyperparameter tuning also use the training split only. Validation picks the model type; OOT is only reported. |
+| Temporal leakage | Training on default labels that were not yet known | A model trained on date T uses only labels observed by T, OOT is the newest label months, and a model never scores months before its training date. Unit tests cover all three. |
+
+## Deployment
+
+**How the model is served.** Batch scoring: once a month Airflow scores all of that month's applications and writes the scores to a gold table, which a loan decision system would read. This fits the data, which arrives in monthly snapshots, and keeps every score reproducible and auditable. In production, scoring at the point of application would use an online service (for example a small FastAPI app) that loads the same artefact and calls the same `prepare_X` code, so training and serving cannot drift apart. That service would need the applicant's features in real time from an online feature store. Streaming is not needed, because labels only arrive months later.
+
+**How a new model goes live.**
+
+| Strategy | What it means | Used here |
+| --- | --- | --- |
+| Champion/challenger | A new model replaces the current one only if it is clearly better on the same held-out data | Yes, the promotion rule |
+| Shadow | A candidate scores real applicants in parallel; its scores are logged but never used | Yes, runner-up and rejected challengers |
+| Canary | The new model decides for a small share of applicants first, for example 5%, then more if all is well | No: needs an online service, and outcomes take 6 months to judge |
+| A/B test | Applicants are split at random between two models and outcomes compared | No: deliberately giving some applicants the weaker model raises fairness and regulatory questions in lending |
+| Blue-green | Two identical environments; traffic switches from one to the other in one step | Equivalent here: the registry points to one champion, so switching is a single new row |
+
+**Rollback.** Every model stays in `model_bank/`. To roll back, add a row to `model_registry.csv` that promotes the previous version with reason `rollback`; inference uses the latest promoted model from the next run.
+
+**Alerts.** A failed task, including a failed data check, is retried once and then shows as failed in Airflow. In production the same failure, a `retrain_flag` or a `shadow_flag` would also send an email or Slack message through Airflow's failure callbacks.
 
 ## Tests
 
@@ -63,4 +109,5 @@ python -m unittest discover -s tests -v
 | `data/` | Source CSVs |
 | `datamart/` | Generated bronze, silver and gold tables |
 | `model_bank/` | Trained model artefacts |
-| `tests/` | Unit tests for label maturity, splits, drift indices, feature rules, model choice and champion lookup |
+| `tests/` | Unit tests for label maturity, splits, drift indices, feature rules, model choice, data checks, explanations, lineage, champion and shadow lookup |
+| `notebooks/` | Model exploration notebook: transformations, feature selection, explainability (SHAP), calibration and shadow results, with figures for slides |

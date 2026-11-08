@@ -56,7 +56,9 @@ def version_colors(df):
 
 
 def label_of(version):
-    return version.replace("credit_model_", "model ").replace("_", "-")
+    # credit_model_2024_01_01_logreg -> "model 2024-01-01 logreg"
+    parts = version[len("credit_model_"):].replace("_runner_up", "").split("_")
+    return f"model {'-'.join(parts[:3])} {'_'.join(parts[3:])}".strip()
 
 
 def mark_promotions(ax, snapshot_date_str):
@@ -145,6 +147,32 @@ def plot_calibration(ax, perf, colors, snapshot_date_str):
     format_dates(ax)
 
 
+def plot_shadow(ax, perf, shadow, colors, snapshot_date_str):
+    # champion (solid) and each shadow (dashed) on the same applicants, pooled live Gini
+    for version, rows in perf.groupby("model_version"):
+        rows = rows.sort_values("cohort_date")
+        ax.plot(rows["cohort_date"], rows["gini_pooled"], color=colors[version], linewidth=2,
+                marker="o", markersize=5, label=f"{label_of(version)} champion")
+    for name, rows in shadow.groupby("shadow_model"):
+        rows = rows.sort_values("cohort_date")
+        champion = rows["model_version"].iloc[0]
+        kind = "runner-up" if name.endswith("_runner_up") else "rejected challenger"
+        source = label_of(name)
+        ax.plot(rows["cohort_date"], rows["gini_pooled"], color=colors[champion], linewidth=1.5,
+                linestyle="--", marker="s", markersize=4, label=f"{source} {kind} (shadow)")
+        flagged = rows[rows["shadow_flag"].astype(bool)]
+        ax.scatter(flagged["cohort_date"], flagged["gini_pooled"], s=80, facecolors="none",
+                   edgecolors=TEXT, zorder=5)
+    mark_promotions(ax, snapshot_date_str)
+    ax.set_title("Shadow models: pooled live Gini vs the champion")
+    ax.set_ylabel("Gini, latest 3 cohorts pooled")
+    ax.set_xlabel("Application month (circled = shadow ahead, promotion review)")
+    values = pd.concat([perf["gini_pooled"], shadow["gini_pooled"]])
+    ax.set_ylim(values.min() - 0.05, values.max() + 0.08)
+    legend_below(ax)
+    format_dates(ax)
+
+
 def load_feature_drift(snapshot_date_str):
     paths = sorted(glob.glob(mu.FEATURE_DRIFT + "feature_drift_*.parquet"))
     frames = [pd.read_parquet(p) for p in paths if mu.partition_date(p) <= snapshot_date_str]
@@ -183,6 +211,7 @@ def main(snapshot_date_str):
     colors = version_colors(df)
     perf = df[df["metric_type"] == "performance"]
     stab = df[df["metric_type"] == "stability"]
+    shadow = df[df["metric_type"] == "shadow"]
 
     panels = []
     if not perf.empty:
@@ -191,6 +220,8 @@ def main(snapshot_date_str):
                    ("calibration", lambda ax: plot_calibration(ax, perf, colors, snapshot_date_str))]
     if not stab.empty:
         panels.insert(1 if panels else 0, ("psi", lambda ax: plot_psi(ax, stab, colors, config, snapshot_date_str)))
+    if not shadow.empty and not perf.empty:
+        panels.append(("shadow", lambda ax: plot_shadow(ax, perf, shadow, colors, snapshot_date_str)))
     drift = load_feature_drift(snapshot_date_str)
     if not drift.empty:
         panels.append(("feature_drift", lambda ax: plot_feature_drift(ax, drift, config)))
