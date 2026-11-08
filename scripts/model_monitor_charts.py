@@ -49,37 +49,29 @@ def load_monitoring(snapshot_date_str):
     return df
 
 
-def version_colors(df):
-    # colour follows the model version (in training order), never its rank
-    versions = sorted(df["model_version"].unique())
-    return {v: SERIES[i % len(SERIES)] for i, v in enumerate(versions)}
-
-
-def label_of(version):
-    # credit_model_2024_01_01_logreg -> "model 2024-01-01 logreg"
-    parts = version[len("credit_model_"):].replace("_runner_up", "").split("_")
-    return f"model {'-'.join(parts[:3])} {'_'.join(parts[3:])}".strip()
+def short_label(version):
+    # credit_model_2024_02_01_xgboost -> "XGB Feb 24"
+    date = pd.to_datetime(mu.version_date(version))
+    family = "LR" if "_logreg" in version else "XGB"
+    return f"{family} {date:%b %y}"
 
 
 def mark_promotions(ax, snapshot_date_str):
+    # a dotted line where each new champion goes live; labels alternate between two heights
     registry = mu.read_registry()
     registry = registry[(registry["promoted"].astype(str) == "True") &
-                        (registry["decision_date"] <= snapshot_date_str)]
-    for _, row in registry.iterrows():
+                        (registry["decision_date"] <= snapshot_date_str)].sort_values("decision_date")
+    for i, (_, row) in enumerate(registry.iterrows()):
         date = pd.to_datetime(row["decision_date"])
         ax.axvline(date, color=MUTED, linewidth=0.8, linestyle=":")
-        ax.annotate(f"{label_of(row['model_version'])} live", (date, 1), xycoords=("data", "axes fraction"),
-                    xytext=(3, -10), textcoords="offset points", color=TEXT_SECONDARY, fontsize=8)
+        ax.annotate(short_label(row["model_version"]), (date, 1), xycoords=("data", "axes fraction"),
+                    xytext=(3, -10 if i % 2 == 0 else -21), textcoords="offset points",
+                    color=TEXT_SECONDARY, fontsize=7)
 
 
-def legend_below(ax):
+def legend_below(ax, ncol=2):
     # legend under the plot so it never covers data or threshold labels
-    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.2), ncol=2, fontsize=8)
-
-
-def headroom(ax, top):
-    # space above the data for the "model live" labels
-    ax.set_ylim(top=top)
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.2), ncol=ncol, fontsize=8)
 
 
 def format_dates(ax):
@@ -87,89 +79,136 @@ def format_dates(ax):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
 
 
-def plot_gini(ax, perf, colors, snapshot_date_str, min_ratio):
-    for version, rows in perf.groupby("model_version"):
-        rows = rows.sort_values("cohort_date")
-        ax.plot(rows["cohort_date"], rows["gini"], color=colors[version], linewidth=2,
-                marker="o", markersize=5, label=f"{label_of(version)} actual Gini")
-        if "gini_pooled" in rows and rows["gini_pooled"].notna().any():
-            ax.plot(rows["cohort_date"], rows["gini_pooled"], color=colors[version], linewidth=1.2,
-                    linestyle="-.", label=f"{label_of(version)} pooled Gini (retrain test)")
-        baseline = rows["baseline_gini"].iloc[0]
-        ax.axhline(baseline, color=colors[version], linewidth=1, linestyle="--",
-                   alpha=0.6, label=f"{label_of(version)} OOT Gini at training")
-        ax.axhline(baseline * min_ratio, color=colors[version], linewidth=0.8, linestyle=":",
-                   alpha=0.6, label=f"{label_of(version)} retrain line ({min_ratio:.0%} of OOT)")
+# Each chart follows the model in production at each date, so it stays readable however often
+# the champion changes. Dotted vertical lines mark each promotion.
+
+def plot_gini(ax, perf, snapshot_date_str, min_ratio):
+    rows = perf.sort_values("cohort_date")
+    ax.plot(rows["cohort_date"], rows["gini"], color=SERIES[0], linewidth=2, marker="o", markersize=5,
+            label="Live Gini of the model in production (one cohort)")
+    ax.plot(rows["cohort_date"], rows["gini_pooled"], color=SERIES[0], linewidth=1.2, linestyle="-.",
+            label="Pooled Gini, latest 3 cohorts of that model (retrain test)")
+    ax.step(rows["cohort_date"], rows["baseline_gini"], where="post", color=SERIES[1], linewidth=1.2,
+            linestyle="--", label="Its OOT Gini at training (baseline)")
+    ax.step(rows["cohort_date"], rows["baseline_gini"] * min_ratio, where="post", color=SERIES[1],
+            linewidth=1, linestyle=":", label=f"Retrain line ({min_ratio:.0%} of baseline)")
     mark_promotions(ax, snapshot_date_str)
     ax.set_title("Performance: Gini by application month")
     ax.set_ylabel("Gini (2·AUC − 1)")
     ax.set_xlabel("Application month (labels observed 6 months later)")
-    headroom(ax, max(perf["gini"].max(), perf["baseline_gini"].max()) + 0.05)
-    ax.set_ylim(bottom=min(perf["gini"].min(), (perf["baseline_gini"] * min_ratio).min()) - 0.05)
+    top = max(rows["gini"].max(), rows["baseline_gini"].max())
+    bottom = min(rows["gini"].min(), (rows["baseline_gini"] * min_ratio).min())
+    ax.set_ylim(bottom - 0.05, top + 0.1)
     legend_below(ax)
     format_dates(ax)
 
 
-def plot_psi(ax, stab, colors, config, snapshot_date_str):
-    for version, rows in stab.groupby("model_version"):
-        rows = rows.sort_values("cohort_date")
-        ax.plot(rows["cohort_date"], rows["psi"], color=colors[version], linewidth=2,
-                marker="o", markersize=5, label=label_of(version))
+def plot_psi(ax, stab, config, snapshot_date_str):
+    rows = stab.sort_values("cohort_date")
+    ax.plot(rows["cohort_date"], rows["psi"], color=SERIES[0], linewidth=2, marker="o", markersize=5,
+            label="Score PSI of the model in production")
+    top = max(rows["psi"].max(), config["monitoring"]["psi_act"])
+    if "max_csi" in rows and rows["max_csi"].notna().any():
+        ax.plot(rows["cohort_date"], rows["max_csi"], color=SERIES[1], linewidth=1.2, linestyle="--",
+                marker="s", markersize=4, label="Largest feature CSI that month")
+        top = max(top, rows["max_csi"].max())
     for value, name in [(config["monitoring"]["psi_watch"], "watch 0.10"),
                         (config["monitoring"]["psi_act"], "act 0.25")]:
         ax.axhline(value, color=MUTED, linewidth=1, linestyle="--")
         ax.annotate(name, (1, value), xycoords=("axes fraction", "data"), xytext=(-4, 3),
                     textcoords="offset points", ha="right", color=TEXT_SECONDARY, fontsize=8)
     mark_promotions(ax, snapshot_date_str)
-    ax.set_title("Stability: PSI of scores vs training OOT")
-    ax.set_ylabel("Population stability index")
+    ax.set_title("Stability: score PSI and largest feature CSI vs training OOT")
+    ax.set_ylabel("Stability index")
     ax.set_xlabel("Scoring month")
-    ax.set_ylim(bottom=0, top=max(stab["psi"].max(), config["monitoring"]["psi_act"]) * 1.25)
+    ax.set_ylim(bottom=0, top=top * 1.35)
     legend_below(ax)
     format_dates(ax)
 
 
-def plot_calibration(ax, perf, colors, snapshot_date_str):
-    # actual rate is the neutral reference; predictions keep their model-version colour
+def plot_calibration(ax, perf, snapshot_date_str):
     rows = perf.sort_values("cohort_date")
     ax.plot(rows["cohort_date"], rows["bad_rate"], color=TEXT_SECONDARY, linewidth=2, marker="o",
             markersize=5, label="Actual default rate")
-    for version, group in rows.groupby("model_version"):
-        ax.plot(group["cohort_date"], group["mean_prediction"], color=colors[version], linewidth=2,
-                marker="o", markersize=5, label=f"{label_of(version)} mean predicted probability")
+    ax.plot(rows["cohort_date"], rows["mean_prediction"], color=SERIES[0], linewidth=2, marker="o",
+            markersize=5, label="Mean predicted probability (model in production)")
     mark_promotions(ax, snapshot_date_str)
     ax.set_title("Calibration: actual vs predicted default rate")
     ax.set_ylabel("Default rate")
     ax.set_xlabel("Application month")
     ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
-    ax.set_ylim(bottom=0, top=max(rows["bad_rate"].max(), rows["mean_prediction"].max()) * 1.2)
+    ax.set_ylim(bottom=0, top=max(rows["bad_rate"].max(), rows["mean_prediction"].max()) * 1.3)
     legend_below(ax)
     format_dates(ax)
 
 
-def plot_shadow(ax, perf, shadow, colors, snapshot_date_str):
-    # champion (solid) and each shadow (dashed) on the same applicants, pooled live Gini
-    for version, rows in perf.groupby("model_version"):
+def plot_shadow(ax, perf, shadow, snapshot_date_str):
+    # same applicants, pooled live Gini: the champion vs its runner-up vs the latest rejected challenger
+    champion = perf.sort_values("cohort_date")
+    ax.plot(champion["cohort_date"], champion["gini_pooled"], color=SERIES[0], linewidth=2, marker="o",
+            markersize=5, label="Champion (model in production)")
+    is_runner_up = shadow["shadow_model"].str.endswith("_runner_up")
+    for rows, label, color, style in [
+            (shadow[is_runner_up], "Shadow: champion's runner-up (other model family)", SERIES[1], "--"),
+            # a different model each time, so markers only: a line would join unrelated models
+            (shadow[~is_runner_up], "Shadow: latest rejected challenger", SERIES[2], "none")]:
+        if rows.empty:
+            continue
         rows = rows.sort_values("cohort_date")
-        ax.plot(rows["cohort_date"], rows["gini_pooled"], color=colors[version], linewidth=2,
-                marker="o", markersize=5, label=f"{label_of(version)} champion")
-    for name, rows in shadow.groupby("shadow_model"):
-        rows = rows.sort_values("cohort_date")
-        champion = rows["model_version"].iloc[0]
-        kind = "runner-up" if name.endswith("_runner_up") else "rejected challenger"
-        source = label_of(name)
-        ax.plot(rows["cohort_date"], rows["gini_pooled"], color=colors[champion], linewidth=1.5,
-                linestyle="--", marker="s", markersize=4, label=f"{source} {kind} (shadow)")
+        ax.plot(rows["cohort_date"], rows["gini_pooled"], color=color, linewidth=1.5, linestyle=style,
+                marker="s", markersize=4, label=label)
         flagged = rows[rows["shadow_flag"].astype(bool)]
-        ax.scatter(flagged["cohort_date"], flagged["gini_pooled"], s=80, facecolors="none",
+        ax.scatter(flagged["cohort_date"], flagged["gini_pooled"], s=90, facecolors="none",
                    edgecolors=TEXT, zorder=5)
     mark_promotions(ax, snapshot_date_str)
     ax.set_title("Shadow models: pooled live Gini vs the champion")
-    ax.set_ylabel("Gini, latest 3 cohorts pooled")
+    ax.set_ylabel("Gini, latest cohorts pooled")
     ax.set_xlabel("Application month (circled = shadow ahead, promotion review)")
     values = pd.concat([perf["gini_pooled"], shadow["gini_pooled"]])
-    ax.set_ylim(values.min() - 0.05, values.max() + 0.08)
-    legend_below(ax)
+    ax.set_ylim(values.min() - 0.05, values.max() + 0.1)
+    legend_below(ax, ncol=1)
+    format_dates(ax)
+
+
+def plot_model_lines(ax, perf, shadow, snapshot_date_str):
+    """One line per model: solid while it is the champion, dashed while it scores in shadow.
+
+    Every point is that model's Gini on one month's applicants, so where two lines meet in the same
+    month they were scored on the same people and can be compared directly.
+    """
+    lines = [(v, rows, "champion") for v, rows in perf.groupby("model_version")]
+    for name, rows in shadow.groupby("shadow_model"):
+        lines.append((name, rows, "runner-up" if name.endswith("_runner_up") else "rejected challenger"))
+    lines.sort(key=lambda line: (mu.version_date(line[0]), line[2] != "champion"))
+    colours = matplotlib.colormaps["viridis"](np.linspace(0, 0.9, len(lines)))
+
+    # the model in production, month by month: a wide grey band under the champion segments
+    production = perf.sort_values("cohort_date")
+    ax.plot(production["cohort_date"], production["gini"], color=TEXT, linewidth=9, alpha=0.12,
+            solid_capstyle="round", zorder=1, label="Model in production (champion each month)")
+
+    for (name, rows, role), colour in zip(lines, colours):
+        rows = rows.sort_values("cohort_date")
+        champion = role == "champion"
+        ax.plot(rows["cohort_date"], rows["gini"], color=colour, linewidth=3 if champion else 1,
+                alpha=1 if champion else 0.6, linestyle="-" if champion else "--",
+                marker="s" if "_logreg" in name else "o", markersize=7 if champion else 4,
+                markerfacecolor=colour if champion else SURFACE, zorder=3 if champion else 2,
+                label=f"{short_label(name)} ({role})")
+
+    # winner each month: the highest Gini among every model scored on that month's applicants
+    scored = pd.concat([perf[["cohort_date", "gini"]], shadow[["cohort_date", "gini"]]], ignore_index=True)
+    best = scored.groupby("cohort_date", as_index=False)["gini"].max()
+    ax.scatter(best["cohort_date"], best["gini"] + 0.025, marker="*", s=110, color="#f2b705",
+               edgecolors=TEXT, linewidths=0.5, zorder=5, label="Best Gini that month")
+
+    mark_promotions(ax, snapshot_date_str)
+    ax.set_title("Live Gini by model: bold = champion, dashed = shadow, star = best")
+    ax.set_ylabel("Gini on that month's applicants")
+    ax.set_xlabel("Application month (circle = XGBoost, square = logistic regression)")
+    values = pd.concat([perf["gini"], shadow["gini"]])
+    ax.set_ylim(values.min() - 0.05, values.max() + 0.13)
+    ax.legend(loc="upper left", bbox_to_anchor=(0, -0.2), ncol=3, fontsize=7)
     format_dates(ax)
 
 
@@ -208,20 +247,20 @@ def main(snapshot_date_str):
         return
 
     os.makedirs(CHART_DIR, exist_ok=True)
-    colors = version_colors(df)
     perf = df[df["metric_type"] == "performance"]
     stab = df[df["metric_type"] == "stability"]
     shadow = df[df["metric_type"] == "shadow"]
 
     panels = []
     if not perf.empty:
-        panels += [("gini", lambda ax: plot_gini(ax, perf, colors, snapshot_date_str,
+        panels += [("gini", lambda ax: plot_gini(ax, perf, snapshot_date_str,
                                                     config["monitoring"]["min_gini_ratio"])),
-                   ("calibration", lambda ax: plot_calibration(ax, perf, colors, snapshot_date_str))]
+                   ("calibration", lambda ax: plot_calibration(ax, perf, snapshot_date_str))]
     if not stab.empty:
-        panels.insert(1 if panels else 0, ("psi", lambda ax: plot_psi(ax, stab, colors, config, snapshot_date_str)))
+        panels.insert(1 if panels else 0, ("psi", lambda ax: plot_psi(ax, stab, config, snapshot_date_str)))
     if not shadow.empty and not perf.empty:
-        panels.append(("shadow", lambda ax: plot_shadow(ax, perf, shadow, colors, snapshot_date_str)))
+        panels.append(("shadow", lambda ax: plot_shadow(ax, perf, shadow, snapshot_date_str)))
+        panels.append(("model_lines", lambda ax: plot_model_lines(ax, perf, shadow, snapshot_date_str)))
     drift = load_feature_drift(snapshot_date_str)
     if not drift.empty:
         panels.append(("feature_drift", lambda ax: plot_feature_drift(ax, drift, config)))
