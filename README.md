@@ -12,10 +12,30 @@ docker compose up
 ```
 
 1. Open [Airflow](http://localhost:8080) and log in with `admin` / `admin`.
-2. Unpause `loan_default_pipeline`. It backfills 31 monthly runs (2023-01 to 2025-07), one month at a time.
+2. Unpause `loan_default_pipeline` (the toggle in the UI, or the command below). It backfills 31 monthly runs (2023-01 to 2025-07), one month at a time.
 3. Outputs appear in `datamart/` and `model_bank/`.
 
-The backfill takes about 1.5 to 2 hours. The first model is trained in the 2024-01 run, about 45 minutes in. Stop with `docker compose down`; add `-v` to also reset Airflow's run history.
+The backfill takes about 1.5 to 2 hours. The first model is trained in the 2024-01 run, about 45 minutes in.
+
+From a second terminal in this folder:
+
+```sh
+# start the backfill (same as the UI toggle)
+docker compose exec airflow-scheduler airflow dags unpause loan_default_pipeline
+
+# check progress: one row per monthly run and its state
+docker compose exec airflow-scheduler airflow dags list-runs -d loan_default_pipeline
+
+# pause it again
+docker compose exec airflow-scheduler airflow dags pause loan_default_pipeline
+```
+
+To shut down:
+
+```sh
+docker compose down      # stop Airflow; outputs in datamart/ and model_bank/ stay
+docker compose down -v   # also reset Airflow's run history, so the next start reruns every month
+```
 
 ## What each monthly run does
 
