@@ -1,0 +1,11 @@
+# Check out text files with Unix line endings on every machine, so the Docker build and the
+# container's bash commands see the same files the pipeline was tested with.
+* text=auto eol=lf
+
+# Binary files: never touch
+*.png binary
+*.pkl binary
+*.parquet binary
+*.pdf binary
+*.docx binary
+*.pptx binary
