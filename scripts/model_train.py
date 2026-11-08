@@ -198,6 +198,13 @@ def main(snapshot_date_str):
     }
     directory = mu.save_artefact(artefact)
 
+    # reload check: the saved file must load and give the same OOT scores as the model in memory
+    reloaded = mu.load_artefact(version)
+    reloaded_scores = reloaded["pipeline"].predict_proba(reference_features)[:, 1]
+    if not np.allclose(reloaded_scores, reference_scores):
+        raise ValueError(f"reload check failed: {version} scores differently after saving")
+    print(f"reload check passed: {version} loads and reproduces its {len(reloaded_scores)} OOT scores")
+
     # human-readable summary next to the pickle
     summary = {k: v for k, v in artefact.items()
                if k not in ["pipeline", "base_pipeline", "runner_up", "reference_scores", "reference_features"]}

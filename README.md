@@ -23,6 +23,7 @@ The backfill covers 31 monthly runs (2023-01 to 2025-07). Airflow runs one task 
 
 | Stage | Tasks | Output |
 | --- | --- | --- |
+| Source checks | `dep_check_source_lms`, `_fe_attr`, `_fe_fin`, `_fe_click` | Before each bronze step: fails the run if the source CSV is missing, empty or lacks `Customer_ID` / `snapshot_date`; logs the rows for the month |
 | Label store | `bronze_lms` → `silver_lms` → `gold_label_store` | `datamart/gold/label_store/` — loans reaching month on book 6 this month, labelled `30dpd_6mob` |
 | Feature store | bronze, silver and gold for attributes, financials and clickstream → `gold_feature_store` | `datamart/gold/feature_store/joined/` — one row per applicant, as of the application date |
 | Training gate | `model_train_gate` | Trains on the first training date (2024-01-01), every 6 months after that, or after a drift alert (minimum 3 months apart); otherwise skips training |
@@ -45,7 +46,7 @@ Settings are in `static/model_config.yaml`.
 - **Calibration:** after the model is chosen, Platt scaling (a one-input logistic regression on the score) is fitted on the validation set. It is kept only if it lowers the Brier score on OOT (the mean squared gap between probability and outcome; lower is better). It never changes the order of applicants, so AUC and Gini are unaffected. The artefact records both Brier scores and the decision.
 - **Shadow models:** the champion's runner-up (the other model type trained on the same date, named for example `credit_model_2024_01_01_xgboost_runner_up`) and any challenger that was not promoted score every month's applicants, but their scores are never used. When the labels arrive, monitoring compares their pooled live Gini with the champion's on the same applicants. A shadow ahead by 0.02 or more over 3 cohorts, while that champion is still in production, sets `shadow_flag`, which calls for a promotion review.
 - **Explanations:** every prediction carries `reason_1` to `reason_3`, the inputs that pushed that applicant's risk up the most. For logistic regression this is coefficient × standardised value; for XGBoost it is the model's built-in SHAP values. The artefact also stores each input's average contribution on OOT (`feature_importance`).
-- **Data checks:** training stops if there are no labelled loans, only one label class, labels other than 0/1 or duplicate loans. Inference stops if a model column is missing from the feature store, a customer appears twice, or a score is not a probability between 0 and 1. A failed check fails the Airflow task, so nothing is written from broken input.
+- **Data checks:** training stops if there are no labelled loans, only one label class, labels other than 0/1 or duplicate loans. Inference stops if a model column is missing from the feature store, a customer appears twice, or a score is not a probability between 0 and 1. After saving, training reloads the model file and confirms it reproduces the same OOT scores. A failed check fails the Airflow task, so nothing is written from broken input.
 - **Lineage:** each artefact records the Python and package versions, the training config and its hash, and a fingerprint of the exact loans and labels used, so a model can be traced and a rerun checked against it.
 
 ## Features

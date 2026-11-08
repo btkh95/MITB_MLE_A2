@@ -22,6 +22,17 @@ def data_stage(stage):
     )
 
 
+def source_check(source):
+    # fails the run before bronze if the source file is missing, empty or lacks key columns
+    return BashOperator(
+        task_id=f"dep_check_source_{source}",
+        bash_command=(
+            "cd /opt/airflow && "
+            f"python scripts/check_source_data.py --source {source} --snapshotdate {{{{ ds }}}}"
+        ),
+    )
+
+
 def model_stage(script, **kwargs):
     return BashOperator(
         task_id=script,
@@ -64,14 +75,14 @@ with DAG(
     gold_label_store = data_stage("gold_label_store")
     label_store_completed = EmptyOperator(task_id="label_store_completed")
 
-    bronze_lms >> silver_lms >> gold_label_store >> label_store_completed
+    source_check("lms") >> bronze_lms >> silver_lms >> gold_label_store >> label_store_completed
 
     # --- feature store ---
     gold_feature_store = data_stage("gold_feature_store")
     feature_store_completed = EmptyOperator(task_id="feature_store_completed")
 
     for source in ["fe_attr", "fe_fin", "fe_click"]:
-        data_stage(f"bronze_{source}") >> data_stage(f"silver_{source}") >> data_stage(f"gold_{source}") >> gold_feature_store
+        source_check(source) >> data_stage(f"bronze_{source}") >> data_stage(f"silver_{source}") >> data_stage(f"gold_{source}") >> gold_feature_store
 
     gold_feature_store >> feature_store_completed
 
