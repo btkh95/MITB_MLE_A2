@@ -14,6 +14,7 @@ matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.ticker
+import numpy as np
 import pandas as pd
 
 from utils import model_utils as mu
@@ -84,18 +85,25 @@ def format_dates(ax):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
 
 
-def plot_gini(ax, perf, colors, snapshot_date_str):
+def plot_gini(ax, perf, colors, snapshot_date_str, min_ratio):
     for version, rows in perf.groupby("model_version"):
         rows = rows.sort_values("cohort_date")
         ax.plot(rows["cohort_date"], rows["gini"], color=colors[version], linewidth=2,
                 marker="o", markersize=5, label=f"{label_of(version)} actual Gini")
-        ax.axhline(rows["baseline_gini"].iloc[0], color=colors[version], linewidth=1, linestyle="--",
+        if "gini_pooled" in rows and rows["gini_pooled"].notna().any():
+            ax.plot(rows["cohort_date"], rows["gini_pooled"], color=colors[version], linewidth=1.2,
+                    linestyle="-.", label=f"{label_of(version)} pooled Gini (retrain test)")
+        baseline = rows["baseline_gini"].iloc[0]
+        ax.axhline(baseline, color=colors[version], linewidth=1, linestyle="--",
                    alpha=0.6, label=f"{label_of(version)} OOT Gini at training")
+        ax.axhline(baseline * min_ratio, color=colors[version], linewidth=0.8, linestyle=":",
+                   alpha=0.6, label=f"{label_of(version)} retrain line ({min_ratio:.0%} of OOT)")
     mark_promotions(ax, snapshot_date_str)
     ax.set_title("Performance: Gini by application month")
     ax.set_ylabel("Gini (2·AUC − 1)")
     ax.set_xlabel("Application month (labels observed 6 months later)")
     headroom(ax, max(perf["gini"].max(), perf["baseline_gini"].max()) + 0.05)
+    ax.set_ylim(bottom=min(perf["gini"].min(), (perf["baseline_gini"] * min_ratio).min()) - 0.05)
     legend_below(ax)
     format_dates(ax)
 
@@ -137,6 +145,33 @@ def plot_calibration(ax, perf, colors, snapshot_date_str):
     format_dates(ax)
 
 
+def load_feature_drift(snapshot_date_str):
+    paths = sorted(glob.glob(mu.FEATURE_DRIFT + "feature_drift_*.parquet"))
+    frames = [pd.read_parquet(p) for p in paths if mu.partition_date(p) <= snapshot_date_str]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def plot_feature_drift(ax, drift, config, top_n=12):
+    # rows: the features that drifted most at any point; columns: scoring months
+    table = drift.pivot_table(index="feature", columns="monitor_date", values="csi")
+    table = table.loc[table.max(axis=1).sort_values(ascending=False).index[:top_n]]
+    act = config["monitoring"]["psi_act"]
+    image = ax.imshow(table.values, aspect="auto", cmap="Oranges", vmin=0, vmax=max(act * 1.5, 0.05))
+    ax.set_yticks(range(len(table.index)), table.index, fontsize=8)
+    months = pd.to_datetime(table.columns)
+    step = max(1, len(months) // 10)
+    ax.set_xticks(range(0, len(months), step), [m.strftime("%b %y") for m in months[::step]])
+    for (i, j), value in np.ndenumerate(table.values):
+        if value >= config["monitoring"]["psi_watch"]:
+            ax.text(j, i, f"{value:.2f}", ha="center", va="center", fontsize=6,
+                    color="white" if value >= act else TEXT)
+    ax.grid(False)
+    ax.set_title(f"Feature drift: CSI of the {len(table.index)} most-drifted inputs")
+    ax.set_xlabel("Scoring month (values shown at CSI ≥ 0.10)")
+    colorbar = ax.figure.colorbar(image, ax=ax, fraction=0.03, pad=0.02)
+    colorbar.set_label("CSI vs training OOT", color=TEXT_SECONDARY)
+
+
 def main(snapshot_date_str):
     config = mu.load_config()
     df = load_monitoring(snapshot_date_str)
@@ -151,10 +186,14 @@ def main(snapshot_date_str):
 
     panels = []
     if not perf.empty:
-        panels += [("gini", lambda ax: plot_gini(ax, perf, colors, snapshot_date_str)),
+        panels += [("gini", lambda ax: plot_gini(ax, perf, colors, snapshot_date_str,
+                                                    config["monitoring"]["min_gini_ratio"])),
                    ("calibration", lambda ax: plot_calibration(ax, perf, colors, snapshot_date_str))]
     if not stab.empty:
         panels.insert(1 if panels else 0, ("psi", lambda ax: plot_psi(ax, stab, colors, config, snapshot_date_str)))
+    drift = load_feature_drift(snapshot_date_str)
+    if not drift.empty:
+        panels.append(("feature_drift", lambda ax: plot_feature_drift(ax, drift, config)))
 
     # one PNG per chart for slides, plus a combined dashboard
     for name, draw in panels:

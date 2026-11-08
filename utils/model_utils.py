@@ -19,6 +19,7 @@ LABEL_STORE = "datamart/gold/label_store/"
 FEATURE_STORE = "datamart/gold/feature_store/joined/"
 PREDICTIONS = "datamart/gold/model_predictions/"
 MONITORING = "datamart/gold/model_monitoring/"
+FEATURE_DRIFT = MONITORING + "feature_drift/"
 MODEL_BANK = "model_bank/"
 REGISTRY = MODEL_BANK + "model_registry.csv"
 
@@ -147,6 +148,86 @@ def available_features(applicants, config):
     return kept, dropped
 
 
+def _bins(values, bins=10):
+    # deciles for numbers with many values; the values themselves otherwise; missing is its own bin
+    values = pd.Series(values)
+    if pd.api.types.is_numeric_dtype(values) and values.nunique() > bins:
+        binned = pd.qcut(values, q=bins, duplicates="drop").astype(str)
+    else:
+        binned = values.astype(str)
+    return binned.where(values.notna(), "missing")
+
+
+def information_value(values, label, bins=10):
+    """Information value (IV): how well one feature separates defaulters from non-defaulters.
+
+    Rule of thumb: < 0.02 not useful, 0.02-0.1 weak, 0.1-0.3 medium, > 0.3 strong.
+    Half a loan is added to every bin so an empty bin does not give an infinite value.
+    """
+    table = pd.crosstab(_bins(values, bins), pd.Series(label).values) + 0.5
+    bad = table[1] / table[1].sum()
+    good = table[0] / table[0].sum()
+    return float(np.sum((good - bad) * np.log(good / bad)))
+
+
+def select_model(val_gini, simplest_first, tie_margin):
+    """Pick the model type to keep, using validation Gini only (never OOT).
+
+    val_gini: {model_type: validation Gini}. simplest_first: model types ordered from the
+    simplest to the most complex. The highest validation Gini wins, unless a simpler model
+    is within tie_margin of it; then the simplest such model wins, because a gap that small
+    is within the noise of a ~500-row validation set and the simpler model is easier to
+    explain and less prone to overfit. Returns (model_type, reason).
+    """
+    top = max(val_gini.values())
+    best = max(val_gini, key=val_gini.get)
+    for model_type in simplest_first:
+        if model_type in val_gini and val_gini[model_type] >= top - tie_margin:
+            if model_type == best:
+                return model_type, "highest validation Gini"
+            return model_type, (f"within {tie_margin} of the best validation Gini "
+                                f"({best} {top:.4f}); simpler model preferred")
+    return best, "highest validation Gini"
+
+
+def prune_features(spec, train, config):
+    """Drop weak and duplicate features using the training split only.
+
+    1. weak: information value below training.min_information_value
+    2. duplicate: of two numeric inputs with |Spearman correlation| above
+       training.max_correlation, keep the one with the higher information value.
+    A *_log1p column follows its raw twin, so logistic regression and XGBoost see the same set.
+    Returns (pruned spec, table with one row per feature and the reason it was dropped, if any).
+    """
+    min_iv = config["training"]["min_information_value"]
+    max_corr = config["training"]["max_correlation"]
+    twins = [c for c in spec["numeric"] if c.endswith("_log1p")]
+    columns = [c for group in ["numeric", "flags", "categorical"] for c in spec[group] if c not in twins]
+
+    report = pd.DataFrame({"feature": columns})
+    report["information_value"] = [information_value(train[c], train["label"]) if c in train else 0.0
+                                   for c in columns]
+    report["dropped"] = np.where(report["information_value"] < min_iv, "weak", "")
+    iv = report.set_index("feature")["information_value"]
+
+    numeric = [c for c in spec["numeric"] + spec["flags"] if c in columns
+               and report.loc[report["feature"] == c, "dropped"].item() == ""]
+    corr = train[numeric].apply(pd.to_numeric, errors="coerce").corr(method="spearman").abs()
+    removed = set()
+    for a in sorted(numeric, key=lambda c: -iv[c]):  # strongest first, so it is the one kept
+        if a in removed:
+            continue
+        for b in numeric:
+            if b != a and b not in removed and corr.loc[a, b] > max_corr:
+                removed.add(b)
+                report.loc[report["feature"] == b, "dropped"] = f"duplicate of {a}"
+
+    dropped = set(report.loc[report["dropped"] != "", "feature"])
+    dropped |= {c for c in twins if c[:-len("_log1p")] in dropped}
+    pruned = {group: [c for c in cols if c not in dropped] for group, cols in spec.items()}
+    return pruned, report.sort_values("information_value", ascending=False, ignore_index=True)
+
+
 #################
 # Model bank    #
 #################
@@ -201,6 +282,13 @@ def champion_as_of(date_str, inclusive=True):
 # Monitoring    #
 #################
 
+def _stability_index(ref_share, cur_share):
+    # sum over bins of (current% - reference%) * ln(current% / reference%); empty bins floored
+    ref_share = np.clip(np.asarray(ref_share, dtype=float), 1e-4, None)
+    cur_share = np.clip(np.asarray(cur_share, dtype=float), 1e-4, None)
+    return float(np.sum((cur_share - ref_share) * np.log(cur_share / ref_share)))
+
+
 def psi(reference, current, bins=10):
     """Population stability index of current scores against reference (decile bins of reference)."""
     reference = np.asarray(reference, dtype=float)
@@ -209,9 +297,37 @@ def psi(reference, current, bins=10):
     edges[0], edges[-1] = -np.inf, np.inf
     ref_share = np.histogram(reference, bins=edges)[0] / len(reference)
     cur_share = np.histogram(current, bins=edges)[0] / len(current)
-    ref_share = np.clip(ref_share, 1e-4, None)
-    cur_share = np.clip(cur_share, 1e-4, None)
-    return float(np.sum((cur_share - ref_share) * np.log(cur_share / ref_share)))
+    return _stability_index(ref_share, cur_share)
+
+
+def csi(reference, current, bins=10):
+    """Characteristic stability index: the PSI formula applied to one input feature.
+
+    Numeric features with many values use decile bins of the reference. Flags, categories and
+    numbers with few distinct values are compared category by category. Missing values are
+    their own bin, so a feature that stops being collected shows up as drift.
+    """
+    reference = pd.Series(reference)
+    current = pd.Series(current)
+    numeric = pd.api.types.is_numeric_dtype(reference) and reference.nunique() > bins
+    if numeric:
+        reference = reference.astype(float)
+        current = pd.to_numeric(current, errors="coerce").astype(float)
+        edges = np.unique(np.quantile(reference.dropna(), np.linspace(0, 1, bins + 1)))
+        edges[0], edges[-1] = -np.inf, np.inf
+
+        def shares(values):
+            counts = np.histogram(values.dropna(), bins=edges)[0]
+            return np.append(counts, values.isna().sum()) / len(values)
+
+        return _stability_index(shares(reference), shares(current))
+
+    ref_cat = reference.astype(object).where(reference.notna(), "missing").astype(str)
+    cur_cat = current.astype(object).where(current.notna(), "missing").astype(str)
+    categories = sorted(set(ref_cat) | set(cur_cat))
+    ref_share = ref_cat.value_counts(normalize=True).reindex(categories, fill_value=0)
+    cur_share = cur_cat.value_counts(normalize=True).reindex(categories, fill_value=0)
+    return _stability_index(ref_share.values, cur_share.values)
 
 
 def read_monitoring(date_str):

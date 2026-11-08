@@ -83,6 +83,12 @@ def main(snapshot_date_str):
     spec, dropped = mu.available_features(applicants, config)
     print("features dropped for low coverage at scoring time:", dropped or "none")
 
+    # --- feature pruning on the training split: weak (low IV) and duplicate (highly correlated) ---
+    spec, feature_report = mu.prune_features(spec, train, config)
+    pruned = feature_report[feature_report["dropped"] != ""]
+    print(f"features pruned on train: {len(pruned)}")
+    print(pruned.to_string(index=False) if len(pruned) else "none")
+
     # --- train and compare candidates ---
     candidates = {}
     for model_type in ["logistic_regression", "xgboost"]:
@@ -99,22 +105,33 @@ def main(snapshot_date_str):
         print(model_type, params, scores)
         candidates[model_type] = {"pipeline": best, "features": features, "params": params, "scores": scores}
 
-    # selection rule: highest OOT Gini
-    best_type = max(candidates, key=lambda t: candidates[t]["scores"]["gini_oot"])
+    # selection rule: highest validation Gini, with a tie-break that prefers the simpler model
+    # when the gap is within select_tie_margin. Each candidate is tuned by CV on train, the
+    # winner is picked on val, and OOT is only reported, so gini_oot stays an unbiased
+    # estimate and a fair baseline for monitoring.
+    best_type, selection_reason = mu.select_model(
+        {t: c["scores"]["gini_val"] for t, c in candidates.items()},
+        simplest_first=["logistic_regression", "xgboost"],
+        tie_margin=config["training"]["select_tie_margin"])
     best = candidates[best_type]
-    print("selected:", best_type)
+    print("selected:", best_type, "-", selection_reason)
 
     # --- save artefact ---
     version = mu.model_version(snapshot_date_str)
     # PSI reference = OOT scores: out-of-sample, so an overfit model's spread-out training
     # scores do not show up as drift in the very first month
-    reference_scores = best["pipeline"].predict_proba(mu.prepare_X(oot, best["features"]))[:, 1]
+    # CSI reference = the same OOT rows, as raw model inputs before preprocessing
+    reference_features = mu.prepare_X(oot, best["features"]).reset_index(drop=True)
+    reference_scores = best["pipeline"].predict_proba(reference_features)[:, 1]
     artefact = {
         "model_version": version,
         "model_type": best_type,
+        "selection_reason": selection_reason,
         "pipeline": best["pipeline"],
         "features": best["features"],
         "dropped_features": dropped,
+        # information value of every candidate feature on train, and why any were pruned
+        "feature_report": feature_report.round(4).to_dict(orient="records"),
         "hyperparameters": best["params"],
         "metrics": best["scores"],
         "candidates": {t: {"params": c["params"], "scores": c["scores"]} for t, c in candidates.items()},
@@ -128,11 +145,13 @@ def main(snapshot_date_str):
                          "oot": round(float(oot["label"].mean()), 4)},
         },
         "reference_scores": reference_scores,
+        "reference_features": reference_features,
     }
     directory = mu.save_artefact(artefact)
 
     # human-readable summary next to the pickle
-    summary = {k: v for k, v in artefact.items() if k not in ["pipeline", "reference_scores"]}
+    summary = {k: v for k, v in artefact.items()
+               if k not in ["pipeline", "reference_scores", "reference_features"]}
     with open(directory + "metadata.json", "w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2, default=str)
     print("saved to:", directory)

@@ -12,6 +12,13 @@ training:
   random_state: 55
   # drop a feature when this share of the current month's applicants lack it
   max_missing_share: 0.5
+  # feature pruning on the training split: drop features with information value below this
+  min_information_value: 0.02
+  # of two numeric features correlated above this (Spearman), keep the more informative one
+  max_correlation: 0.9
+  # model choice: if a simpler model's validation Gini is within this of the best one, keep
+  # the simpler model (logistic regression before XGBoost); a smaller gap is noise on ~500 rows
+  select_tie_margin: 0.01
 
 promotion:
   # a challenger replaces the champion only if its OOT AUC is higher by this margin
@@ -22,6 +29,9 @@ monitoring:
   psi_act: 0.25
   # flag retraining when Gini falls below this share of the model's OOT Gini
   min_gini_ratio: 0.9
+  # the Gini compared against that line pools this many latest monthly cohorts of the same
+  # model (one cohort of ~500 loans is too noisy on its own)
+  gini_window_months: 3
   # months between a prediction and its default label (label definition 30dpd_6mob)
   label_lag_months: 6
 
