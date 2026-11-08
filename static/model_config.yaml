@@ -3,7 +3,13 @@
 training:
   # scheduled training dates; a drift alert can also trigger training in between
   first_train_date: "2024-01-01"
-  retrain_every_months: 6
+  # launch setting: retrain every month (about 20 seconds of compute) so a new model is watched
+  # closely; each new model still has to beat the champion to be promoted. Once the model is
+  # stable, raise this to 6 to cut model churn and sign-off work (the drift triggers still apply).
+  retrain_every_months: 1
+  # source coverage trigger: retrain at once (no cooldown) when any champion input is missing for
+  # this many more applicants than at training, e.g. clickstream stopping in July 2024 (0 -> 100%)
+  coverage_max_missing_rise: 0.5
   # minimum months between two trainings, so one drift alert does not retrain every month
   retrain_cooldown_months: 3
   # newest label months held out as out-of-time (OOT) test
@@ -33,6 +39,9 @@ monitoring:
   # the Gini compared against that line pools this many latest monthly cohorts of the same
   # model (one cohort of ~500 loans is too noisy on its own)
   gini_window_months: 3
+  # calibration trigger: flag when the mean predicted default rate differs from the actual rate by
+  # this much (5 percentage points) over the same pooled cohorts
+  calibration_max_gap: 0.05
   # shadow model: flag a promotion review when its pooled live Gini beats the champion's by this
   shadow_min_gini_gain: 0.02
   # months between a prediction and its default label (label definition 30dpd_6mob)

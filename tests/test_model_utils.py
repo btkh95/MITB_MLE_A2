@@ -228,6 +228,81 @@ class TestLineage(unittest.TestCase):
         self.assertNotEqual(first, mu.lineage(config, data.assign(label=[0, 0]))["training_data_sha256"])
 
 
+class TestRetrainTriggers(TempStores):
+    def test_coverage_drop_finds_a_source_that_stopped(self):
+        reference = pd.DataFrame({"Age": [30.0, 40.0], "fe_1_mean": [1.0, 2.0]})
+        current = pd.DataFrame({"Age": [35.0, 45.0], "fe_1_mean": [np.nan, np.nan]})
+        self.assertEqual(mu.coverage_drop(reference, current), (1.0, "fe_1_mean"))
+        self.assertEqual(mu.coverage_drop(reference, reference)[0], 0.0)
+
+    def test_calibration_gap_is_predicted_minus_actual(self):
+        scored = pd.DataFrame({"model_predictions": [0.2, 0.2, 0.2, 0.2], "label": [1, 0, 0, 0]})
+        self.assertAlmostEqual(mu.calibration_gap(scored), -0.05)
+
+    def test_gate_retrains_at_once_when_a_source_stops(self):
+        saved = (mu.MODEL_BANK, mu.MONITORING, mu.load_config)
+        mu.MODEL_BANK = self.tmp + "model_bank/"
+        mu.MONITORING = self.tmp + "monitoring/"
+        config = mu.load_config()
+        config["training"].update({"retrain_every_months": 6, "coverage_max_missing_rise": 0.5})
+        mu.load_config = lambda: config
+        try:
+            version = mu.model_version("2024-01-01", "xgboost")
+            mu.write_registry_row({"decision_date": "2024-01-01", "model_version": version,
+                                   "model_type": "xgboost", "promoted": True})
+            features = {"numeric": ["Age", "fe_1_mean"], "flags": [], "categorical": []}
+            mu.save_artefact({"model_version": version, "features": features,
+                              "reference_features": pd.DataFrame({"Age": [30.0, 40.0], "fe_1_mean": [1.0, 2.0]})})
+            for date, clicks in [("2024-03-01", [1.0, 2.0]), ("2024-04-01", [np.nan, np.nan])]:
+                write_month(mu.FEATURE_STORE, "gold_feature_store_", date, pd.DataFrame({
+                    "Customer_ID": ["C1", "C2"], "snapshot_date": [date] * 2, "Age": [31, 41],
+                    "fe_1_mean": clicks}))
+            self.assertFalse(mu.should_train("2024-03-01"))  # 2 months in, inputs still arriving
+            self.assertTrue(mu.should_train("2024-04-01"))   # clickstream stopped: retrain before month 6
+        finally:
+            mu.MODEL_BANK, mu.MONITORING, mu.load_config = saved
+
+
+class TestDriftAlertsFollowTheChampion(TempStores):
+    def test_only_the_current_champions_alert_can_retrain(self):
+        saved = (mu.MODEL_BANK, mu.MONITORING, mu.load_config)
+        mu.MODEL_BANK, mu.MONITORING = self.tmp + "model_bank/", self.tmp + "monitoring/"
+        config = mu.load_config()
+        config["training"].update({"retrain_every_months": 6, "retrain_cooldown_months": 3})
+        mu.load_config = lambda: config
+        try:
+            retired = mu.model_version("2024-01-01", "logistic_regression")
+            current = mu.model_version("2024-04-01", "xgboost")
+            features = {"numeric": ["Age"], "flags": [], "categorical": []}
+            for date, version, mtype in [("2024-01-01", retired, "logistic_regression"),
+                                         ("2024-04-01", current, "xgboost")]:
+                mu.write_registry_row({"decision_date": date, "model_version": version,
+                                       "model_type": mtype, "promoted": True})
+                mu.save_artefact({"model_version": version, "features": features,
+                                  "reference_features": pd.DataFrame({"Age": [30.0, 40.0]})})
+            write_month(mu.FEATURE_STORE, "gold_feature_store_", "2024-08-01", pd.DataFrame({
+                "Customer_ID": ["C1", "C2"], "snapshot_date": ["2024-08-01"] * 2, "Age": [31, 41]}))
+
+            def monitoring(rows):
+                os.makedirs(mu.MONITORING, exist_ok=True)
+                pd.DataFrame(rows).to_parquet(mu.MONITORING + "monitoring_2024_07_01.parquet", index=False)
+
+            # July monitoring: the January cohort's outcomes arrived and flag the retired model
+            monitoring([{"metric_type": "performance", "model_version": retired, "retrain_flag": True,
+                         "gini_flag": True},
+                        {"metric_type": "stability", "model_version": current, "retrain_flag": False,
+                         "gini_flag": False}])
+            self.assertFalse(mu.should_train("2024-08-01"))
+            # the current champion's own alert still retrains (4 months since training > cooldown)
+            monitoring([{"metric_type": "performance", "model_version": retired, "retrain_flag": True,
+                         "gini_flag": True},
+                        {"metric_type": "stability", "model_version": current, "retrain_flag": True,
+                         "gini_flag": False}])
+            self.assertTrue(mu.should_train("2024-08-01"))
+        finally:
+            mu.MODEL_BANK, mu.MONITORING, mu.load_config = saved
+
+
 class TestChampion(TempStores):
     def setUp(self):
         super().setUp()
@@ -245,6 +320,14 @@ class TestChampion(TempStores):
         self.assertEqual(mu.shadows_as_of("2023-12-01"), [])
         self.assertEqual([s[0] for s in mu.shadows_as_of("2024-03-01")],
                          ["credit_model_2024_01_01_xgboost_runner_up"])
+        self.assertEqual([s[0] for s in mu.shadows_as_of("2025-01-01")],
+                         ["credit_model_2024_07_01_logreg_runner_up", "credit_model_2025_01_01_xgboost"])
+
+    def test_only_the_latest_rejected_challenger_runs_in_shadow(self):
+        mu.write_registry_row({"decision_date": "2024-10-01", "model_type": "xgboost", "promoted": False,
+                               "model_version": mu.model_version("2024-10-01", "xgboost")})
+        self.assertEqual([s[0] for s in mu.shadows_as_of("2024-12-01")],
+                         ["credit_model_2024_07_01_logreg_runner_up", "credit_model_2024_10_01_xgboost"])
         self.assertEqual([s[0] for s in mu.shadows_as_of("2025-01-01")],
                          ["credit_model_2024_07_01_logreg_runner_up", "credit_model_2025_01_01_xgboost"])
 

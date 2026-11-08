@@ -436,7 +436,8 @@ def shadows_as_of(date_str):
     """Models that score applicants alongside the champion without affecting decisions.
 
     1. the champion's runner-up: the other model type trained on the same date
-    2. challengers trained after the champion that were not promoted
+    2. the latest challenger trained after the champion that was not promoted (with monthly
+       retraining, older rejected challengers are superseded by newer ones)
     Returns a list of (shadow name, artefact version, artefact key holding the pipeline).
     """
     champion = champion_as_of(date_str)
@@ -450,7 +451,9 @@ def shadows_as_of(date_str):
     rejected = registry[(registry["promoted"].astype(str) != "True") &
                         (registry["decision_date"] > champion_date) &
                         (registry["decision_date"] <= date_str)]
-    shadows += [(v, v, "pipeline") for v in rejected["model_version"]]
+    if not rejected.empty:
+        latest = rejected.sort_values("decision_date")["model_version"].iloc[-1]
+        shadows.append((latest, latest, "pipeline"))
     return shadows
 
 
@@ -511,13 +514,38 @@ def read_monitoring(date_str):
     return pd.read_parquet(path) if os.path.exists(path) else pd.DataFrame()
 
 
+def coverage_drop(reference, current):
+    """Largest rise in the share of missing values for any model input, reference -> current.
+
+    reference and current are model inputs (prepare_X output) with the same columns. A source
+    that stops arriving (for example clickstream from July 2024) shows up as a rise towards 1.0.
+    Returns (largest rise, the input with that rise).
+    """
+    rise = current.isna().mean() - reference.isna().mean()
+    if rise.empty:
+        return 0.0, None
+    return float(rise.max()), rise.idxmax()
+
+
+def calibration_gap(scored):
+    """Mean predicted default probability minus the actual default rate (positive = over-predicts)."""
+    return float(scored["model_predictions"].mean() - scored["label"].mean())
+
+
 def should_train(date_str):
-    """Training gate: first model, scheduled refresh, or a drift alert after the cooldown."""
-    config = load_config()["training"]
+    """Training gate.
+
+    Trains on the first date, on the scheduled refresh, at once when a data source the champion
+    needs stops arriving (coverage trigger, no cooldown), or after last month's monitoring flagged
+    score drift, a Gini drop or a calibration gap (after the cooldown).
+    """
+    full_config = load_config()
+    config = full_config["training"]
     if date_str < config["first_train_date"]:
         print("before first training date")
         return False
-    if read_features(date_str).empty:
+    applicants = read_features(date_str)
+    if applicants.empty:
         print("no applications this month; nothing to train for")
         return False
 
@@ -532,10 +560,29 @@ def should_train(date_str):
         print(f"{months_since} months since last training -> scheduled retrain")
         return True
 
+    # coverage trigger: compare this month's applicants with the champion's training-time OOT rows
+    champion = champion_as_of(date_str, inclusive=False)
+    if champion is not None:
+        artefact = load_artefact(champion)
+        reference = artefact.get("reference_features")
+        if reference is not None:
+            rise, feature = coverage_drop(reference, prepare_X(applicants, artefact["features"]))
+            if rise >= config["coverage_max_missing_rise"]:
+                print(f"{feature} missing for {rise:.0%} more applicants than at training "
+                      "-> source coverage dropped, retrain now")
+                return True
+
+    # drift triggers: only last month's rows about the current champion count. Outcomes arrive
+    # 6 months after scoring, so a performance row can describe a model already retired; its
+    # alert stays in the monitoring table for the record but must not retrain the current model.
     previous = read_monitoring(shift_months(date_str, -1))
-    drift = not previous.empty and previous["retrain_flag"].any()
+    if not previous.empty:
+        previous = previous[previous["model_version"] == champion]
+    drift = not previous.empty and previous["retrain_flag"].fillna(False).astype(bool).any()
     if drift and months_since >= config["retrain_cooldown_months"]:
-        print("monitoring flagged drift last month -> retrain")
+        reasons = [c for c in ["psi_flag", "gini_flag", "calibration_flag"]
+                   if c in previous and previous[c].fillna(False).astype(bool).any()]
+        print(f"monitoring flagged {', '.join(reasons) or 'drift'} last month -> retrain")
         return True
 
     print(f"{months_since} months since last training, drift flag: {drift} -> skip")

@@ -86,7 +86,7 @@ with DAG(
 
     gold_feature_store >> feature_store_completed
 
-    # --- model training: only on the first date, every 6 months, or after a drift alert ---
+    # --- model training: first date, then every retrain_every_months (1 at launch), or after a drift alert ---
     # skipping training must not skip inference, so only the direct downstream task is skipped
     model_train_gate = ShortCircuitOperator(
         task_id="model_train_gate",

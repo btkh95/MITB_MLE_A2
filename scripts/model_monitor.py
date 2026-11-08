@@ -68,15 +68,21 @@ def stability_row(snapshot_date_str, config):
         "psi_status": psi_status(value, config),
         # only score drift triggers a retrain; feature drift explains it. With ~70 inputs,
         # one feature crossing a line by chance each month is likely, so CSI is a warning.
-        "retrain_flag": value >= config["monitoring"]["psi_act"],
+        "psi_flag": bool(value >= config["monitoring"]["psi_act"]),
+        "retrain_flag": bool(value >= config["monitoring"]["psi_act"]),
     }
     drift = feature_drift(snapshot_date_str, artefact, config)
     if not drift.empty:
+        rise = drift["missing_share_current"] - drift["missing_share_reference"]
         row.update({
             "max_csi": float(drift["csi"].iloc[0]),
             "max_csi_feature": drift["feature"].iloc[0],
             "n_features_watch": int((drift["csi_status"] == "watch").sum()),
             "n_features_act": int((drift["csi_status"] == "act").sum()),
+            # source coverage: the training gate retrains at once on this; logged here to chart it
+            "max_missing_rise": float(rise.max()),
+            "max_missing_rise_feature": drift.loc[rise.idxmax(), "feature"],
+            "coverage_flag": bool(rise.max() >= config["training"]["coverage_max_missing_rise"]),
         })
     return row, drift
 
@@ -174,6 +180,11 @@ def performance_row(snapshot_date_str, config):
     pooled = pd.concat(window, ignore_index=True)
     gini_pooled = gini_of(pooled)
     gini_ratio = gini_pooled / baseline_gini if baseline_gini > 0 else np.nan
+    gini_flag = bool(gini_ratio < config["monitoring"]["min_gini_ratio"])
+    # calibration trigger: predicted vs actual default rate over the same pooled cohorts;
+    # retraining recalibrates the probabilities (Platt scaling is part of training)
+    gap = mu.calibration_gap(pooled)
+    calibration_flag = bool(abs(gap) >= config["monitoring"]["calibration_max_gap"])
     return {
         "metric_type": "performance",
         "cohort_date": cohort_date,
@@ -189,7 +200,10 @@ def performance_row(snapshot_date_str, config):
         "n_pooled": len(pooled),
         "baseline_gini": float(baseline_gini),
         "gini_ratio": float(gini_ratio),
-        "retrain_flag": bool(gini_ratio < config["monitoring"]["min_gini_ratio"]),
+        "calibration_gap_pooled": gap,
+        "gini_flag": gini_flag,
+        "calibration_flag": calibration_flag,
+        "retrain_flag": gini_flag or calibration_flag,
     }
 
 
